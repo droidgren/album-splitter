@@ -124,6 +124,9 @@ Implemented in `export.py` + `exiftool.py`. Notes:
   uncompressed scans). If one scan exists in several formats, the JPG keeps the plain id and
   the others get the extension appended (`IMG_0055.tif` -> `IMG_0055_tif`).
 - Should also run in Docker (target: QNAP NAS); keep a `Dockerfile` working.
+  `docker-compose.yml` is the QNAP Container Station application (start page on port 8000,
+  volumes `/scans` read-only, `/work`, `/export`, `/config` = `$HOME` for the recent list).
+  `.github/workflows/docker.yml` pushes an amd64+arm64 image to `ghcr.io/droidgren/album-splitter`.
 
 ## First milestone
 Detection + heuristic linking on `samples/`, plus a debug image per page with boxes and

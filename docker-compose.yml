@@ -1,0 +1,34 @@
+# albumsplit on a QNAP NAS (Container Station 3: Applications -> Create -> paste this file).
+#
+# Before creating the application:
+#  1. Change the four left-hand paths under "volumes" to shared folders on your NAS.
+#     /share/<Folder>/... is how QNAP shared folders appear (File Station shows the names).
+#     The work and export folders must not be inside the scan folder; create them first.
+#  2. Optional: put your Anthropic API key in ANTHROPIC_API_KEY to use Claude.
+#  3. The image is private while the GitHub repo is: in Container Station add the registry
+#     ghcr.io (Settings -> Registry) with your GitHub user name and a personal access token
+#     with the read:packages scope. (Or make the package public on GitHub.)
+#
+# Then open http://<nas-ip>:8000/ . On the start page pick /scans as the scan folder and
+# /work as the work folder; export to /export.
+
+services:
+  albumsplit:
+    image: ghcr.io/droidgren/album-splitter:latest
+    # To build on the NAS instead of pulling: copy the repository to the NAS, remove the
+    # "image" line above and uncomment these two lines (use the folder you copied it to).
+    # build:
+    #   context: /share/Container/album-splitter
+    container_name: albumsplit
+    restart: unless-stopped
+    command: ["review", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"            # change the left number if 8000 is taken on the NAS
+    environment:
+      TZ: Europe/Stockholm
+      ANTHROPIC_API_KEY: ""    # e.g. sk-ant-... ; leave empty to work without Claude
+    volumes:
+      - /share/Photos/AlbumScans:/scans:ro      # scanned album pages (never modified)
+      - /share/Photos/albumsplit-work:/work     # albumsplit's own files (page JSON, previews)
+      - /share/Photos/AlbumExport:/export       # exported photos, cards and index.csv
+      - /share/Container/albumsplit-config:/config   # recent-projects list
