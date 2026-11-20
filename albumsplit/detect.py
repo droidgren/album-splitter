@@ -753,56 +753,77 @@ def _snap_rect(rect: tuple, grad: tuple[np.ndarray, np.ndarray], paperlike: np.n
         other = "v" if axis == "u" else "u"
         adj = (new[other + "-"], new[other + "+"])  # positions of the two adjacent sides
         perp = (new["u+"] - new["u-"]) if axis == "u" else (new["v+"] - new["v-"])
-        last_ok, miss = 0, 0
-        for o in range(1, int(min(perp * 0.6, long_side * 0.06)) + 1):
-            pos = new[key] + sign * o
-            xi, yi, _ = line(axis, pos)
-            if len(xi) < 40:
+        # A long pale sky can run past one step's reach: keep going while the evidence
+        # (side edges or tint) lasts right up to the end of the step.
+        for _ in range(3):
+            step = int(min(perp * 0.6, long_side * 0.06))
+            grown = _push_side(new, key, step, axes, line, c, grad, paperlike, lab, p)
+            new[key] += sign * grown
+            if grown < step - 6:
                 break
-            on_paper = paperlike[yi, xi].mean()
-            if on_paper < 0.5:
-                break  # into another print
-            edges = []
-            for a in adj:
-                # A real edge, not grain: the median over a 9 px stretch of the side line
-                # (allowing it to sit 2 px either way) must be strong.
-                best = 0.0
-                for d in range(-2, 3):
-                    vals = []
-                    for k in range(-4, 5):
-                        q = c + n_side * (pos + k) + along * (a + d)
-                        qx, qy = int(round(q[0])), int(round(q[1]))
-                        if 0 <= qx < w and 0 <= qy < h:
-                            vals.append(abs(gx[qy, qx] * along[0] + gy[qy, qx] * along[1]))
-                    if vals:
-                        best = max(best, float(np.median(vals)))
-                edges.append(best >= 1.5 * p.snap_min_grad)
-            tinted = False
-            if lab is not None and any(edges):
-                bx, by = [], []
-                for k in range(10, 21, 2):
-                    qx, qy, _ = line(axis, pos + sign * k)
-                    bx.append(qx)
-                    by.append(qy)
-                bx, by = np.concatenate(bx), np.concatenate(by)
-                if len(bx) >= 40 and paperlike[by, bx].mean() >= 0.8:  # paper out there
-                    # Colour only: paper brightness drifts near prints (shading, phone shots).
-                    diff = np.median(lab[yi, xi, 1:], axis=0) - np.median(lab[by, bx, 1:], axis=0)
-                    tinted = float(np.linalg.norm(diff)) > 2.5
-            if not tinted and on_paper < 0.9 and not all(edges):
-                break  # writing or other marks, and the print's side edges have ended
-            seen = tinted or all(edges)
-            if seen:
-                last_ok, miss = o, 0
-            else:
-                miss += 1
-                if miss > 6:
-                    break  # the side edges have ended: this is the print's border
-        if last_ok >= 4:
-            new[key] += sign * last_ok
+
     nu0, nu1, nv0, nv1 = new["u-"], new["u+"], new["v-"], new["v+"]
     nc = c + u * (nu0 + nu1) / 2 + v * (nv0 + nv1) / 2
     return ((float(nc[0]), float(nc[1])), (float(nu1 - nu0), float(nv1 - nv0)), ang), unconfirmed
+
+
+def _push_side(new: dict, key: str, step: int, axes: dict, line, c: np.ndarray,
+               grad: tuple[np.ndarray, np.ndarray], paperlike: np.ndarray,
+               lab: np.ndarray | None, p: Params) -> int:
+    """How far (px, up to `step`) one side of a snapped rect may move outward across
+    paper-coloured print content. See the second pass in _snap_rect."""
+    gx, gy = grad
+    h, w = gx.shape
+    axis, sign = key[0], (1 if key[1] == "+" else -1)
+    n_side, along = axes[axis]
+    other = "v" if axis == "u" else "u"
+    adj = (new[other + "-"], new[other + "+"])  # positions of the two adjacent sides
+    last_ok, miss = 0, 0
+    for o in range(1, step + 1):
+        pos = new[key] + sign * o
+        xi, yi, _ = line(axis, pos)
+        if len(xi) < 40:
+            break
+        on_paper = paperlike[yi, xi].mean()
+        if on_paper < 0.5:
+            break  # into another print
+        edges = []
+        for a in adj:
+            # A real edge, not grain: the median over a 9 px stretch of the side line
+            # (allowing it to sit 2 px either way) must be strong.
+            best = 0.0
+            for d in range(-2, 3):
+                vals = []
+                for k in range(-4, 5):
+                    q = c + n_side * (pos + k) + along * (a + d)
+                    qx, qy = int(round(q[0])), int(round(q[1]))
+                    if 0 <= qx < w and 0 <= qy < h:
+                        vals.append(abs(gx[qy, qx] * along[0] + gy[qy, qx] * along[1]))
+                if vals:
+                    best = max(best, float(np.median(vals)))
+            edges.append(best >= 1.5 * p.snap_min_grad)
+        tinted = False
+        if lab is not None and any(edges):
+            bx, by = [], []
+            for k in range(10, 21, 2):
+                qx, qy, _ = line(axis, pos + sign * k)
+                bx.append(qx)
+                by.append(qy)
+            bx, by = np.concatenate(bx), np.concatenate(by)
+            if len(bx) >= 40 and paperlike[by, bx].mean() >= 0.8:  # paper out there
+                # Colour only: paper brightness drifts near prints (shading, phone shots).
+                diff = np.median(lab[yi, xi, 1:], axis=0) - np.median(lab[by, bx, 1:], axis=0)
+                tinted = float(np.linalg.norm(diff)) > 2.5
+        if not tinted and on_paper < 0.9 and not all(edges):
+            break  # writing or other marks, and the print's side edges have ended
+        seen = tinted or all(edges)
+        if seen:
+            last_ok, miss = o, 0
+        else:
+            miss += 1
+            if miss > 6:
+                break  # the side edges have ended: this is the print's border
+    return last_ok if last_ok >= 4 else 0
 
 
 def _framed_by_edges(rect: tuple, grad: tuple[np.ndarray, np.ndarray], p: Params) -> bool:
@@ -854,6 +875,23 @@ def _framed_sides(rect: tuple, grad: tuple[np.ndarray, np.ndarray], p: Params,
                 best = max(best, float(np.percentile(g, 10)))
             framed += best >= p.snap_min_grad
     return framed
+
+
+def _corner_print(r: _Region, grad: tuple[np.ndarray, np.ndarray], p: Params) -> bool:
+    """A print lying in a corner of a flatbed scan, cut off by the scanner on two sides.
+
+    No paper shows beyond it there, so it falls outside the page hull like the table or
+    binding around a photographed page. Those touch three or four image sides, or are no
+    clean rectangle (the page edge runs at an angle in a photo). A corner print touches two
+    adjacent sides, and its other two sides are print edges.
+    """
+    h, w = grad[0].shape
+    x, y, bw, bh = cv2.boundingRect(r.contour)
+    left, top, right, bottom = x <= 1, y <= 1, x + bw >= w - 1, y + bh >= h - 1
+    if left + top + right + bottom > 2 or (left and right) or (top and bottom):
+        return False
+    return (r.rectangularity >= p.good_rect and r.aspect <= p.max_aspect
+            and _framed_sides(r.rect, grad, p) == 4)
 
 
 def _inside(contour: np.ndarray, mask: np.ndarray) -> float:
@@ -913,7 +951,7 @@ def detect_photos(lab: np.ndarray, paper: np.ndarray, p: Params
             continue  # paper colour estimate failed; nothing sensible to say
         if covered(c) > 0.5:
             continue  # fragment of a photo already found (e.g. separated by a light sky)
-        if r.touches_border and _inside(c, page_hull) < 0.5:
+        if r.touches_border and _inside(c, page_hull) < 0.5 and not _corner_print(r, grad, p):
             # Mostly outside the page: table, other pages, spiral binding of a photographed album.
             cv2.drawContours(nonpage, [c], -1, 255, cv2.FILLED)
             continue
@@ -1080,17 +1118,20 @@ def detect_texts(lab: np.ndarray, paper: np.ndarray, photo_mask: np.ndarray,
     n, labels, stats, _ = cv2.connectedComponentsWithStats(blocks, connectivity=8)
     boxes: list[tuple[int, int, int, int]] = []
     edge_marks: list[tuple[int, int, int, int]] = []
+    fragments: list[tuple[int, int, int, int]] = []
     for i in range(1, n):
         member = (labels == i) & (ink > 0)
         if not (member & ~hole_ink).any():
             continue  # nothing but punch-hole-like marks
         cnt = int(member.sum())
-        if cnt < p.min_block_ink:
-            continue
         ys, xs = np.nonzero(member)
         x0, x1, y0, y1 = xs.min(), xs.max() + 1, ys.min(), ys.max() + 1
-        if max(y1 - y0, x1 - x0) < p.min_block_h_frac * long_side * 2 or \
-                min(y1 - y0, x1 - x0) < p.min_block_h_frac * long_side:
+        if cnt < p.min_block_ink or max(y1 - y0, x1 - x0) < p.min_block_h_frac * long_side * 2 \
+                or min(y1 - y0, x1 - x0) < p.min_block_h_frac * long_side:
+            if cnt >= p.min_block_ink // 6:
+                # Too small to be a caption -- but it may be a letter of one standing a
+                # little apart (the "i" of "en dag i"). Kept only if it joins a caption.
+                fragments.append((int(x0), int(y0), int(x1 - x0), int(y1 - y0)))
             continue
         bw, bh = x1 - x0, y1 - y0
         if bh > 6 * bw or bw > 25 * bh:
@@ -1105,12 +1146,35 @@ def detect_texts(lab: np.ndarray, paper: np.ndarray, photo_mask: np.ndarray,
             edge_marks.append(box)  # punch-hole remnant -- or the first letter of a caption
         else:
             boxes.append(box)
-    pieces = _merge_boxes(boxes + edge_marks, gap=max(2, int(long_side * 0.003)))
+    pieces = _merge_boxes(boxes + edge_marks + fragments, gap=max(2, int(long_side * 0.003)))
     merged = _merge_lines(_split_at_photo_gaps(pieces, ink, photo_mask), ink, photo_mask, blue)
+    # Again on the merged blocks: a short piece (a date like "27/8 95") between two captions
+    # under neighbouring photos can bridge them; only now are both halves caption-sized.
+    merged = _split_at_photo_gaps(merged, ink, photo_mask, min_gap=0.8)
     # Keep a small mark at the binding edge only if it joined a caption ("D" of "David");
-    # left on its own it is a punch hole or its shadow.
+    # left on its own it is a punch hole or its shadow. Likewise small fragments: dust.
     merged = [b for b in merged if any(_overlaps(b, r) for r in boxes)]
     return merged
+
+
+def _text_outline(box: tuple[int, int, int, int], photo_mask: np.ndarray) -> np.ndarray | None:
+    """The paper part of a text box that runs onto a photo, as a polygon (else None).
+
+    A caption may wrap around a print's corner: one line above it, the rest beside it. Its
+    box then covers a corner of that print, which must not end up in the caption crop.
+    """
+    x, y, bw, bh = box
+    sub = photo_mask[y:y + bh, x:x + bw]
+    if cv2.countNonZero(sub) < 0.03 * bw * bh:
+        return None  # grazing a photo's edge
+    free = np.zeros((bh + 2, bw + 2), np.uint8)  # 1 px frame: contours along the box sides
+    free[1:-1, 1:-1] = np.where(sub > 0, 0, 255)
+    cs, _ = cv2.findContours(free, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cs:
+        return None
+    c = max(cs, key=cv2.contourArea)
+    poly = cv2.approxPolyDP(c, 2.0, True).reshape(-1, 2).astype(np.float32)
+    return poly + np.array([x - 1, y - 1], np.float32)
 
 
 def _overlaps(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
@@ -1190,13 +1254,16 @@ def _between_photos(a: list[int], b: list[int], photo_mask: np.ndarray) -> bool:
 
 
 def _split_at_photo_gaps(boxes: list[tuple[int, int, int, int]], ink: np.ndarray,
-                         photo_mask: np.ndarray) -> list[tuple[int, int, int, int]]:
+                         photo_mask: np.ndarray, min_gap: float = 0.0
+                         ) -> list[tuple[int, int, int, int]]:
     """Split blocks that the dilation joined across a gap between two photos.
 
     Two captions side by side under two neighbouring photos can sit closer than the dilation
     reaches. Where a block spans the continuation of the paper gap between two photos (right
     above or below it) and its ink leaves an empty column there, it is cut in two -- if both
-    halves are caption-sized (`_between_photos`).
+    halves are caption-sized (`_between_photos`). With `min_gap`, the empty run of columns
+    at the cut must be at least that many line heights wide: a gap between words, not
+    between two letters of a title running above both photos.
     """
     h, w = photo_mask.shape
     band = max(8, int(0.04 * max(h, w)))
@@ -1211,9 +1278,10 @@ def _split_at_photo_gaps(boxes: list[tuple[int, int, int, int]], ink: np.ndarray
                 continue
             empty = ~ink[y:y + bh, x:x + bw].any(axis=0)
             on = np.nonzero(cols)[0]
+            need = min_gap * _line_height(ink, [x, y, x + bw, y + bh]) if min_gap else 0.0
             # photo-free columns between photo columns: a gap between two photos
             for c in np.nonzero(~cols)[0]:
-                if on.min() < c < on.max() and empty[c]:
+                if on.min() < c < on.max() and empty[c] and _empty_run(empty, c) >= need:
                     cut = c
                     break
             if cut is not None:
@@ -1231,6 +1299,16 @@ def _split_at_photo_gaps(boxes: list[tuple[int, int, int, int]], ink: np.ndarray
         else:
             out.append((x, y, bw, bh))
     return out
+
+
+def _empty_run(empty: np.ndarray, c: int) -> int:
+    """Width of the run of True values in `empty` that contains index c."""
+    lo, hi = c, c
+    while lo > 0 and empty[lo - 1]:
+        lo -= 1
+    while hi < len(empty) - 1 and empty[hi + 1]:
+        hi += 1
+    return hi - lo + 1
 
 
 def _ink_blue(ink: np.ndarray, blue: np.ndarray, r: list[int]) -> float:
@@ -1267,7 +1345,8 @@ def _merge_lines(boxes: list[tuple[int, int, int, int]], ink: np.ndarray, photo_
                 v_gap = max(a[1], b[1]) - min(a[3], b[3])
                 if h_gap > 0 and v_gap > 0:
                     continue  # diagonal neighbours
-                line_h = (_line_height(ink, a) + _line_height(ink, b)) / 2
+                # The larger: a lone letter ("i") is shorter than the writing it belongs to.
+                line_h = max(_line_height(ink, a), _line_height(ink, b))
                 same_line = v_overlap >= 0.5 * min(ha, hb) and h_gap <= 2.2 * line_h
                 stacked = (h_overlap >= 0.5 * min(a[2] - a[0], b[2] - b[0])
                            and 0 <= v_gap <= 1.0 * line_h)
@@ -1277,8 +1356,9 @@ def _merge_lines(boxes: list[tuple[int, int, int, int]], ink: np.ndarray, photo_
                     continue  # side by side under (or over) two photos: one caption each
                 if blue is not None:
                     ba, bb = _ink_blue(ink, blue, a), _ink_blue(ink, blue, b)
-                    if max(ba, bb) > 8 and abs(ba - bb) > 8:
-                        continue  # different pens
+                    if max(ba, bb) > 8 and min(ba, bb) < 5:
+                        continue  # blue ballpoint next to neutral ink: different pens
+                    # (A caption corrected in black still has a bluish median: not neutral.)
                 u = [min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])]
 
                 def on_photo(r: list[int]) -> int:
@@ -1375,12 +1455,15 @@ def detect_page(img_bgr: np.ndarray, p: Params | None = None) -> Detection:
                            int(round(max(lab.shape[:2]) * p.text_margin_frac)))
     texts = [TextBlock(id=0, box=box_to_full(b)) for b in text_boxes]
     padded = {id(t): box_to_full(m) for t, m in zip(texts, margined)}
+    outlines_t = {id(t): _text_outline(m, photo_mask) for t, m in zip(texts, margined)}
     texts = _reading_order(texts, lambda t: t.center())
     for i, t in enumerate(texts, 1):
         t.id = i
     links = link_heuristic(photos, texts)
     for t in texts:
         t.box = padded[id(t)]
+        ol = outlines_t[id(t)]
+        t.outline = [to_full(pt) for pt in ol] if ol is not None else None
 
     page_quad = None
     if cv2.countNonZero(nonpage) > 0.03 * nonpage.size:

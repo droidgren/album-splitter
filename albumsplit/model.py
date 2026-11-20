@@ -59,6 +59,9 @@ class TextBlock:
     box: tuple[int, int, int, int]  # x, y, w, h in full-resolution pixel coordinates
     transcription: str | None = None
     date: str | None = None
+    # Part of `box` that is paper, when the box runs onto a photo (a caption wrapped around a
+    # print's corner). Polygon in full-res coords; export should blank out what lies outside.
+    outline: list[Point] | None = None
 
     def bbox(self) -> tuple[float, float, float, float]:
         x, y, w, h = self.box
@@ -108,7 +111,8 @@ class Page:
             ],
             texts=[
                 TextBlock(id=t["id"], box=tuple(t["box"]),
-                          transcription=t.get("transcription"), date=t.get("date"))
+                          transcription=t.get("transcription"), date=t.get("date"),
+                          outline=[tuple(c) for c in t["outline"]] if t.get("outline") else None)
                 for t in d.get("texts", [])
             ],
             links=[Link(**lk) for lk in d.get("links", [])],
@@ -145,3 +149,36 @@ def page_id_from_path(rel_path: str | PurePath) -> str:
     p = PurePath(rel_path)
     parts = [*p.parts[:-1], p.stem]
     return "__".join(_UNSAFE.sub("_", _ascii(part)).strip("_") or "_" for part in parts)
+
+
+# When one scan exists in several formats (IMG_0055.jpg + IMG_0055.tif), the first
+# extension in this order keeps the plain id so existing work JSON stays attached to it.
+_EXT_PRIORITY = (".jpg", ".jpeg", ".tif", ".tiff", ".png")
+
+
+def assign_page_ids(rel_paths: list[PurePath]) -> dict[PurePath, str]:
+    """Page ids for a set of files, made unique when files differ only by extension.
+
+    `IMG_0055.jpg` -> `IMG_0055`, `IMG_0055.tif` -> `IMG_0055_tif`. Files that share a
+    base id get the extension appended, except the one with the highest-priority extension.
+    Raises ValueError if ids still collide.
+    """
+    groups: dict[str, list[PurePath]] = {}
+    for rp in rel_paths:
+        groups.setdefault(page_id_from_path(rp), []).append(rp)
+
+    def rank(rp: PurePath) -> tuple[int, str]:
+        ext = rp.suffix.lower()
+        return (_EXT_PRIORITY.index(ext) if ext in _EXT_PRIORITY else len(_EXT_PRIORITY), ext)
+
+    ids: dict[PurePath, str] = {}
+    owner: dict[str, PurePath] = {}
+    for base, members in groups.items():
+        members.sort(key=rank)
+        for i, rp in enumerate(members):
+            pid = base if i == 0 else f"{base}_{_UNSAFE.sub('_', rp.suffix.lower().lstrip('.'))}"
+            if pid in owner:
+                raise ValueError(f"Page id collision: {rp} and {owner[pid]} -> {pid}")
+            owner[pid] = rp
+            ids[rp] = pid
+    return ids

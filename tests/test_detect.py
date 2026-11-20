@@ -154,3 +154,31 @@ def test_print_cut_by_paper_white_band_stays_one():
     assert len(det.photos) == 1, [_bbox(ph) for ph in det.photos]
     x0, y0, x1, y1 = _bbox(det.photos[0])
     assert abs(x0 - 400) < 25 and abs(y0 - 400) < 25 and abs(x1 - 1900) < 25 and abs(y1 - 1600) < 25
+
+
+def test_print_in_scan_corner_is_kept():
+    # A print cut off by the scanner at the top and right: no paper beyond it on those
+    # sides, so it lies outside the paper hull -- but it is a print, not the table.
+    page = np.full((PAGE_H, PAGE_W, 3), PAPER, np.uint8)
+    page[0:1400, 1300:PAGE_W] = make_print(PAGE_W - 1300, 1400, seed=3)
+    cv2.rectangle(page, (1300, -2), (PAGE_W + 2, 1399), (150, 150, 150), 2)
+    page[1800:2900, 200:1600] = make_print(1400, 1100, seed=4)
+    cv2.rectangle(page, (200, 1800), (1599, 2899), (150, 150, 150), 2)
+    det = detect_page(page)
+    assert det.page_quad is None
+    assert len(det.photos) == 2
+    x0, y0, x1, y1 = min((p.bbox() for p in det.photos), key=lambda b: b[1])
+    assert abs(x0 - 1300) < 40 and y0 < 20 and x1 > PAGE_W - 20 and abs(y1 - 1400) < 40
+
+
+def test_text_outline_leaves_out_the_photo():
+    from albumsplit.detect import _text_outline
+    mask = np.zeros((400, 400), np.uint8)
+    mask[100:400, 0:200] = 255  # photo below-left of the caption's corner
+    assert _text_outline((250, 50, 100, 100), mask) is None  # clear of the photo
+    poly = _text_outline((100, 50, 200, 150), mask)  # wraps around the photo's corner
+    assert poly is not None
+    inside = np.zeros_like(mask)
+    cv2.fillPoly(inside, [poly.astype(np.int32)], 255)
+    assert cv2.countNonZero(inside & mask) < 0.01 * 200 * 150
+    assert cv2.countNonZero(inside) > 0.6 * 200 * 150

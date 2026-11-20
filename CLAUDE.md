@@ -64,14 +64,17 @@ Per photo:
   `DateTimeOriginal` if known (use exiftool or piexif).
 - `<page>_<n>_card.jpg` — the photo with the linked handwritten text crop(s) composited
   as a strip underneath on a white background. Do NOT just crop a union bounding box —
-  it would include parts of neighbouring photos.
+  it would include parts of neighbouring photos. A caption wrapped around a print's corner
+  has `texts[].outline` (its box minus the photo): blank out everything outside it.
 - One `index.csv` per run: file, source page, caption text, date.
 
 ## Conventions
 - Python 3.11+, English identifiers, type hints, small modules
   (`detect.py`, `link.py`, `llm.py`, `review/`, `export.py`, `model.py`).
 - Never modify source scans.
-- Deterministic page ids from relative file path.
+- Deterministic page ids from relative file path. Input may be JPG, PNG or TIFF (8/16-bit,
+  uncompressed scans). If one scan exists in several formats, the JPG keeps the plain id and
+  the others get the extension appended (`IMG_0055.tif` -> `IMG_0055_tif`).
 - Should also run in Docker (target: QNAP NAS); keep a `Dockerfile` working.
 
 ## First milestone

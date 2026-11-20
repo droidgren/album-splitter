@@ -29,3 +29,15 @@ def test_json_roundtrip(tmp_path: Path):
     assert loaded == page
     assert loaded.status == "proposed"
     assert not list(path.parent.glob("*.tmp"))
+
+
+def test_assign_page_ids_disambiguates_formats():
+    from albumsplit.model import assign_page_ids
+    paths = [PurePosixPath(p) for p in
+             ["IMG_0055.tif", "IMG_0055.jpg", "IMG_0055.png", "IMG_0008.png", "a/IMG_0008.tif"]]
+    ids = assign_page_ids(paths)
+    assert ids[paths[1]] == "IMG_0055"
+    assert ids[paths[0]] == "IMG_0055_tif"
+    assert ids[paths[2]] == "IMG_0055_png"
+    assert ids[paths[3]] == "IMG_0008"
+    assert ids[paths[4]] == "a__IMG_0008"

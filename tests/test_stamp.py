@@ -20,8 +20,10 @@ _DIGITS = {"0": "abcdef", "1": "bc", "2": "abdeg", "3": "abcdg", "4": "bcfg", "5
            "6": "acdefg", "7": "abc", "8": "abcdefg", "9": "abcdfg"}
 
 
-def stamp_mask(text: str, h: int = H) -> np.ndarray:
-    """Seven-segment rendering of e.g. "6 5 '95" (1.0 = lit), with a gap at each segment end."""
+def stamp_mask(text: str, h: int = H, cell_gap: float = 0.25) -> np.ndarray:
+    """Seven-segment rendering of e.g. "6 5 '95" (1.0 = lit), with a gap at each segment end.
+    "_" is a digit cell left dark (a digit too faint to see). `cell_gap` (x h) is the space
+    between digit cells, which differs between cameras."""
     w, t, gap = int(0.55 * h), max(2, int(0.13 * h)), 0.12
     width = int(len(text) * (w + 0.4 * h)) + h
     m = np.zeros((h + 2 * t, width), np.float32)
@@ -29,6 +31,8 @@ def stamp_mask(text: str, h: int = H) -> np.ndarray:
     for ch in text:
         if ch == " ":
             x += int(0.9 * h)
+        elif ch == "_":
+            x += w + int(cell_gap * h)
         elif ch == "'":
             cv2.line(m, (x, t), (x - 2, t + int(0.3 * h)), 1.0, t)
             x += int(0.3 * h)
@@ -40,7 +44,7 @@ def stamp_mask(text: str, h: int = H) -> np.ndarray:
                 ex, ey = bx - gap * (bx - ax), by - gap * (by - ay)
                 cv2.line(m, (x + int(sx * w), t + int(sy * h)), (x + int(ex * w), t + int(ey * h)),
                          1.0, t)
-            x += w + int(0.25 * h)
+            x += w + int(cell_gap * h)
     m = m[:, :x + t]
     return cv2.GaussianBlur(m, (0, 0), 0.05 * h)  # a little optical glow
 
@@ -61,9 +65,10 @@ def make_print(seed: int, light_corner: bool = False, stripes: bool = False) -> 
     return np.clip(img + noise, 0, 255).astype(np.uint8)
 
 
-def add_stamp(img: np.ndarray, text: str, alpha: float = 0.9) -> tuple[int, int, int, int]:
+def add_stamp(img: np.ndarray, text: str, alpha: float = 0.9, cell_gap: float = 0.25
+              ) -> tuple[int, int, int, int]:
     """Burn the stamp into the bottom right of the print; returns its box (x0, y0, x1, y1)."""
-    m = stamp_mask(text)
+    m = stamp_mask(text, cell_gap=cell_gap)
     h, w = img.shape[:2]
     x0, y0 = int(0.9 * w) - m.shape[1], int(0.93 * h) - m.shape[0]
     roi = img[y0:y0 + m.shape[0], x0:x0 + m.shape[1]].astype(np.float32)
@@ -177,3 +182,44 @@ def test_ones_are_narrow_and_stay_in_their_field(text, date):
     add_stamp(img, text)
     st = find_stamp(*on_page(img))
     assert st is not None and st.date == date
+
+
+
+def _line(glyphs: list[tuple[str, int, int]], h: int = 34) -> "Candidate":
+    """A read-ready line from (char, x0, x1) glyphs ("'" = apostrophe), each digit's patch a
+    rendered seven-segment digit."""
+    from albumsplit.stamp import Candidate, _Glyph
+    gl = []
+    for ch, x0, x1 in glyphs:
+        if ch == "'":
+            gl.append(_Glyph(x0, 0, x1, int(0.3 * h), "tick"))
+            continue
+        m = stamp_mask(ch, h)
+        ys, xs = np.nonzero(m > 0.3)
+        g = _Glyph(x0, 0, x1, h, "digit")
+        g.patch = m[ys.min():ys.max() + 1, xs.min():xs.max() + 1] * 40
+        gl.append(g)
+    return Candidate(glyphs=gl, digit_h=float(h), box=(gl[0].x0, 0, gl[-1].x1, h), flipped=False,
+                     contrast=2.0)
+
+
+# Glyph positions measured on a real stamp (IMG_0055.tif): `21 6 '92`, digit height 34-35 px.
+# This camera leaves a wide gap before the "1", as wide as a gap between fields.
+_REAL_21_6_92 = [("2", 1167, 1190), ("1", 1213, 1221), ("6", 1267, 1290), ("'", 1303, 1311),
+                 ("9", 1314, 1336), ("2", 1344, 1368)]
+
+
+def test_widely_spaced_one_stays_in_its_field():
+    from albumsplit.stamp import StampParams, _read
+    c = _line(_REAL_21_6_92)
+    _read(c, StampParams())
+    assert c.date == "1992-06-21"
+
+
+def test_missing_digit_gives_no_date():
+    """With the faint 6 not found, the rest must not be read as `2 1 '92` = 1992-01-02:
+    the gap where the 6 was has room for a whole digit."""
+    from albumsplit.stamp import StampParams, _read
+    c = _line([g for g in _REAL_21_6_92 if g[0] != "6"])
+    _read(c, StampParams())
+    assert c.date is None

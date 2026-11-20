@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .detect import Params
 from .imageio import find_images
-from .model import page_id_from_path
+from .model import assign_page_ids
 from .pipeline import process_page
 
 
@@ -24,13 +24,13 @@ def cmd_detect(args: argparse.Namespace) -> int:
         print(f"No images found in {input_dir}", file=sys.stderr)
         return 1
 
-    ids: dict[str, Path] = {}
-    for p in images:
-        pid = page_id_from_path(p.relative_to(input_dir))
-        if pid in ids:
-            print(f"Page id collision: {p} and {ids[pid]} -> {pid}", file=sys.stderr)
-            return 1
-        ids[pid] = p
+    # Ids are assigned over every image in the input dir (not just --only matches) so a
+    # page keeps the same id however the run is filtered.
+    try:
+        ids = assign_page_ids([p.relative_to(input_dir) for p in find_images(input_dir)])
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return 1
 
     params = Params(stamps=args.stamps)
     failures = 0
@@ -38,7 +38,7 @@ def cmd_detect(args: argparse.Namespace) -> int:
         t0 = time.perf_counter()
         try:
             res = process_page(input_dir, path, work_dir, force=args.force, debug=args.debug,
-                               params=params)
+                               params=params, page_id=ids[path.relative_to(input_dir)])
         except Exception as e:  # keep going on a bad scan
             failures += 1
             print(f"[{i}/{len(images)}] {path.name}: ERROR {e}", file=sys.stderr)

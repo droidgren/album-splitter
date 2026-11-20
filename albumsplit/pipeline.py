@@ -30,9 +30,10 @@ def debug_path(work_dir: Path, page_id: str) -> Path:
 
 
 def process_page(input_dir: Path, image_path: Path, work_dir: Path, *, force: bool = False,
-                 debug: bool = True, params: Params | None = None) -> Result:
+                 debug: bool = True, params: Params | None = None,
+                 page_id: str | None = None) -> Result:
     rel = image_path.relative_to(input_dir)
-    page_id = page_id_from_path(rel)
+    page_id = page_id or page_id_from_path(rel)
     json_path = page_json_path(work_dir, page_id)
     if json_path.exists() and not force and Page.load(json_path).status == "approved":
         return Result(page_id, skipped=True)

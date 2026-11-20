@@ -50,7 +50,11 @@ def render_debug(page: Page, img_bgr: np.ndarray, long_side: int = 1600) -> np.n
         pids = linked.get(t.id, [])
         color = photo_color(pids[0]) if pids else GREY
         x0, y0, x1, y1 = t.bbox()
-        cv2.rectangle(canvas, pt((x0, y0)), pt((x1, y1)), color, th, cv2.LINE_AA)
+        if t.outline:  # box runs onto a photo: draw the paper part only
+            cv2.polylines(canvas, [np.array([pt(p) for p in t.outline], np.int32)], True, color, th,
+                          cv2.LINE_AA)
+        else:
+            cv2.rectangle(canvas, pt((x0, y0)), pt((x1, y1)), color, th, cv2.LINE_AA)
         for pid in pids:
             cv2.line(canvas, pt(t.center()), pt(photos[pid].center()), photo_color(pid), max(1, th - 1),
                      cv2.LINE_AA)

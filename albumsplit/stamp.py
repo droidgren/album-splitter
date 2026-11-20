@@ -39,7 +39,10 @@ class StampParams:
     long_side: int = 1600        # rectified photo size (long side, px)
     grow: float = 0.012          # outward margin around the photo quad (frames can stop short)
     band: float = 0.36           # search band along each long edge (fraction of the short side)
-    digit_h: tuple[float, ...] = (0.018, 0.024, 0.031, 0.040, 0.052, 0.068)  # x short side
+    # digit heights to search (x short side): steps of ~15 %, finer than the glyph size window
+    # (0.7-1.35 h) suggests is needed -- glow and closing make real digits look taller
+    digit_h: tuple[float, ...] = (0.018, 0.021, 0.024, 0.027, 0.031, 0.035, 0.040, 0.046,
+                                  0.052, 0.060, 0.068)
     b_weight: float = 0.3        # warm = a* + b_weight * b*
     low_abs: float = 4.0         # hysteresis thresholds on the warm contrast (Lab units) ...
     high_abs: float = 9.0
@@ -48,10 +51,15 @@ class StampParams:
     reread_rel: tuple[float, ...] = (0.25, 0.35, 0.5)  # local thresholds (x line peak)
     min_digits: int = 3          # decoded digits needed to accept a stamp
     min_score: float = 1.0
+    min_score_undated: float = 2.0  # a line that reads as no valid date must be clearer
     year_pivot: int = 70         # two-digit years >= pivot are 19YY, below 20YY
     years: tuple[int, int] = (1975, 2015)  # era of date-imprinting film cameras
     alt_gap: float = 0.5         # keep other dates whose readings cost less extra than this
     max_mean_cost: float = 1.5   # digits fit worse than this on average: keep text, no date
+    # A gap wider than this (x digit height) inside a line has room for a whole digit: one was
+    # probably missed (too faint), so the date read without it is not trusted. Field gaps on
+    # the samples reach 1.8 (a one-digit day padded to two cells).
+    max_gap: float = 2.1
 
 
 # Seven-segment patterns, segments "abcdefg" (a top, b upper right, c lower right, d bottom,
@@ -98,6 +106,7 @@ class Candidate:
     box: tuple[int, int, int, int]       # x0, y0, x1, y1 in the oriented crop
     flipped: bool                         # found in the crop rotated by 180°
     contrast: float
+    regrouped: bool = False               # fields only came out right after joining two
     score: float = 0.0
     text: str = ""
     fields: list[str] = field(default_factory=list)
@@ -117,7 +126,7 @@ def find_stamp(img_bgr: np.ndarray, corners: list[Point], outline: list[Point] |
     if not cands:
         return None
     best = max(cands, key=lambda c: c.score)
-    if best.score < sp.min_score:
+    if best.score < (sp.min_score if best.date else sp.min_score_undated):
         return None
     if best.date and _mean_cost(best) > sp.max_mean_cost:
         # A stamp, but the digits are too damaged to trust the date: leave it for review.
@@ -128,8 +137,12 @@ def find_stamp(img_bgr: np.ndarray, corners: list[Point], outline: list[Point] |
 
 
 def _mean_cost(c: Candidate) -> float:
-    """How badly the chosen digits explain their glyphs, on average (0 = perfectly)."""
-    costs = [g.costs.get(g.char, 3.0) for g in c.glyphs if g.kind == "digit"]
+    """How badly the chosen digits explain their glyphs, on average (0 = perfectly).
+
+    Ones are left out: a single bar fits almost any narrow blob, so it says nothing about how
+    trustworthy the reading of the other digits is.
+    """
+    costs = [g.costs.get(g.char, 3.0) for g in c.glyphs if g.kind == "digit" and g.char != "1"]
     return float(np.mean(costs)) if costs else 3.0
 
 
@@ -303,10 +316,10 @@ def candidates(crop: np.ndarray, valid: np.ndarray, sp: StampParams) -> list[Can
             db = np.ascontiguousarray(
                 warm_contrast(np.ascontiguousarray(w_[y_off - pad:]), r_[y_off - pad:], k)[pad:])
             vb = np.ascontiguousarray(v_[y_off:])
+            wb, rb = w_[y_off:], r_[y_off:]
             mask, lo = stamp_mask(db, vb, sp)
             if not mask.any():
                 continue
-            wb, rb = w_[y_off:], r_[y_off:]
             for c in _lines(mask, db, h, lo):
                 best = c
                 _repatch(c, wb, rb)
@@ -399,7 +412,13 @@ def _glyphs(mask: np.ndarray, h: float) -> list[_Glyph]:
     only ~0.15 h apart, so it may merge them as well: blobs wider than a digit are cut again at
     the thinnest columns of a lighter closing (0.1 h, which keeps the gaps between digits).
     An apostrophe touching its digit is split off later, per line (_split_merged).
+    Vertical streaks much taller than a digit (a shelf edge, a tree trunk) are removed first:
+    a digit touching one would otherwise be lost in a blob too tall to read.
     """
+    streak = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
+                              cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(3, int(1.6 * h)))))
+    if streak.any():
+        mask = cv2.bitwise_and(mask, cv2.bitwise_not(streak))
     closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, ellipse(max(2, int(round(0.2 * h)))))
     light = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, ellipse(max(2, int(round(0.1 * h)))))
     n, labels, stats, _ = cv2.connectedComponentsWithStats(closed, connectivity=8)
@@ -666,6 +685,14 @@ def _read(c: Candidate, sp: StampParams) -> None:
     for use_ticks in (True, False):
         groups, year_field = _fields(c, use_ticks)
         found = _best_date(groups, year_field, sp)
+        if found is None:
+            # Field gaps vary between cameras ("21" can be spaced like two fields): try the
+            # splits into three fields at the widest gaps.
+            for groups, year_field in _fields_by_gaps(c, use_ticks):
+                found = _best_date(groups, year_field, sp)
+                if found is not None:
+                    c.regrouped = True
+                    break
         if found is not None or not use_ticks:
             break
     if found is None:
@@ -677,6 +704,12 @@ def _read(c: Candidate, sp: StampParams) -> None:
         c.date, c.fields, chars, c.date_alts = found
         for g, ch in zip([g for grp in groups for g in grp], chars):
             g.char = ch
+        if _max_gap(c) > sp.max_gap or (c.regrouped and _mean_cost(c) > sp.max_mean_cost):
+            # (Joining two fields is a guess: only worth it if the digits are clear.)
+            # Room for a missed digit: the reading may be off by a whole field. Keep it for
+            # review only.
+            c.date_alts = [c.date] + c.date_alts
+            c.date = None
     c.text = " ".join(("'" if i == year_field else "") + f for i, f in enumerate(c.fields))
 
 
@@ -712,6 +745,51 @@ def _fields(c: Candidate, use_ticks: bool) -> tuple[list[list[_Glyph]], int | No
     if year_field is not None and year_field >= len(groups):
         year_field = None
     return groups, year_field
+
+
+def _gaps(c: Candidate) -> list[float]:
+    """Gap (px) after each glyph of the line, widened where the next glyph is a "1" by the unlit
+    part of its digit cell (a "1" lights only the right side of the cell)."""
+    dw = _digit_width(c)
+    out = []
+    for a, b in zip(c.glyphs, c.glyphs[1:]):
+        gw = b.x1 - b.x0
+        unlit = (dw - gw) if b.kind == "digit" and dw and gw < 0.62 * dw else 0.0
+        out.append(float(b.x0 - a.x1 - unlit))
+    return out
+
+
+def _max_gap(c: Candidate) -> float:
+    """Widest gap inside the line, in digit heights."""
+    gaps = _gaps(c)
+    return max(gaps) / c.digit_h if gaps else 0.0
+
+
+def _fields_by_gaps(c: Candidate, use_ticks: bool) -> list[tuple[list[list[_Glyph]], int | None]]:
+    """Three-field readings of a line whose gaps made four fields, one gap too many.
+
+    Field gaps vary between cameras: the "21" of `21 6 '92` can be spaced like two fields.
+    The two neighbouring one-digit fields with the narrowest gap between them are joined.
+    """
+    groups, year_field = _fields(c, use_ticks)
+    if len(groups) != 4:
+        return []
+    gap_of = dict(zip((id(g) for g in c.glyphs[1:]), _gaps(c)))
+    one_w = 0.62 * _digit_width(c)
+    out = []
+    for i in range(3):
+        if len(groups[i]) != 1 or len(groups[i + 1]) != 1 or year_field == i + 1:
+            continue
+        second = groups[i + 1][0]
+        # Only where the spacing is ambiguous for a known reason: a "1" sits at the right of
+        # its digit cell, so how much gap it leaves depends on the camera's cell width.
+        if not second.x1 - second.x0 < one_w or gap_of.get(id(second), 1e9) > 0.9 * c.digit_h:
+            continue
+        merged = groups[:i] + [groups[i] + groups[i + 1]] + groups[i + 2:]
+        yf = year_field if year_field is None or year_field <= i else year_field - 1
+        out.append((gap_of.get(id(groups[i + 1][0]), 0.0), merged, yf))
+    out.sort(key=lambda o: o[0])
+    return [(g, yf) for _, g, yf in out[:1]]
 
 
 def _best_date(groups: list[list[_Glyph]], year_field: int | None, sp: StampParams
@@ -762,5 +840,6 @@ def _score(c: Candidate, cw: int, sp: StampParams) -> float:
     # Prior: the stamp sits at the right end of the bottom edge of the upright crop.
     cx = (c.box[0] + c.box[2]) / 2 / cw
     pos = 0.5 + 0.5 * float(np.clip((cx - 0.3) / 0.4, 0, 1))
-    shape = 1.5 if c.date else (0.6 if len(c.fields) == 3 else 0.4)
+    # (A date that needed two fields joined is weaker evidence than one the gaps gave.)
+    shape = (1.0 if c.regrouped else 1.5) if c.date else (0.6 if len(c.fields) == 3 else 0.4)
     return fit * min(read, 6) / 3 * min(c.contrast, 3.0) * regular * pos * shape
