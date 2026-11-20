@@ -23,12 +23,13 @@ class DateStamp:
     date: str | None = None  # ISO date if the read parses as a valid date
     date_alts: list[str] = field(default_factory=list)  # nearly as likely readings, for review
     score: float = 0.0
+    reader: str = "ocr"  # or "llm:<model>" once Claude has read it in review
 
     @classmethod
     def from_dict(cls, d: dict) -> DateStamp:
         return cls(corners=[tuple(c) for c in d["corners"]], text=d.get("text"),
                    date=d.get("date"), date_alts=list(d.get("date_alts", [])),
-                   score=d.get("score", 0.0))
+                   score=d.get("score", 0.0), reader=d.get("reader", "ocr"))
 
 
 @dataclass
@@ -40,6 +41,10 @@ class Photo:
     # `corners` is still the whole print; export should blank out what lies outside this.
     outline: list[Point] | None = None
     stamp: DateStamp | None = None
+    # Set in review. None means derived from the linked texts and the stamp at export time
+    # (see effective_caption / effective_date).
+    caption: str | None = None
+    date: str | None = None
 
     def bbox(self) -> tuple[float, float, float, float]:
         """Axis-aligned bounding box as (x0, y0, x1, y1)."""
@@ -102,6 +107,7 @@ class Page:
     page_quad: list[Point] | None = None  # page outline if the paper does not fill the frame
     issues: list[Issue] = field(default_factory=list)
     status: Status = "proposed"
+    edited: bool = False  # changed in review: re-running detect keeps it unless --force
     detector_version: str = ""
     linker: str = "heuristic"  # or "llm:<model>" when Claude linked and transcribed the texts
     schema_version: int = SCHEMA_VERSION
@@ -120,7 +126,8 @@ class Page:
                 Photo(id=p["id"], corners=[tuple(c) for c in p["corners"]],
                       needs_review=p.get("needs_review", False),
                       outline=[tuple(c) for c in p["outline"]] if p.get("outline") else None,
-                      stamp=DateStamp.from_dict(p["stamp"]) if p.get("stamp") else None)
+                      stamp=DateStamp.from_dict(p["stamp"]) if p.get("stamp") else None,
+                      caption=p.get("caption"), date=p.get("date"))
                 for p in d.get("photos", [])
             ],
             texts=[
@@ -135,6 +142,7 @@ class Page:
                           photo_ids=list(i.get("photo_ids", [])), source=i.get("source", "llm"))
                     for i in d.get("issues", [])],
             status=d.get("status", "proposed"),
+            edited=d.get("edited", False),
             detector_version=d.get("detector_version", ""),
             linker=d.get("linker", "heuristic"),
             schema_version=d.get("schema_version", SCHEMA_VERSION),
@@ -149,6 +157,50 @@ class Page:
     @classmethod
     def load(cls, path: Path) -> Page:
         return cls.from_dict(json.loads(path.read_text(encoding="utf-8")))
+
+    def linked_texts(self, photo_id: int) -> list[TextBlock]:
+        """Texts linked to a photo, in reading order (text ids follow reading order)."""
+        ids = {lk.text_id for lk in self.links if lk.photo_id == photo_id}
+        return sorted((t for t in self.texts if t.id in ids), key=lambda t: t.id)
+
+
+_HYPHEN_BREAK = re.compile(r"(?<=[^\W\d_])-\s*\n\s*(?=[a-zåäö])")
+_HYPHEN_KEEP = re.compile(r"(?<=\w)-[ \t]*\n\s*(?=\S)")
+
+
+def flatten_caption(text: str) -> str:
+    """One line of running text from a handwritten transcription.
+
+    The line breaks follow the width of the paper, not the meaning, so they become spaces. A word
+    split at a line break ("svinhus-\\ntaket") is joined again ("svinhustaket"). A hyphen before
+    a capital or a digit ("Karl-\\nJohan", "-\\n84") is kept.
+    """
+    text = _HYPHEN_BREAK.sub("", text)
+    text = _HYPHEN_KEEP.sub("-", text)
+    return " ".join(text.split())
+
+
+def derived_caption(page: Page, photo: Photo) -> str | None:
+    """Caption from the linked texts' transcriptions, flattened to one line."""
+    parts = [flatten_caption(t.transcription) for t in page.linked_texts(photo.id)
+             if t.transcription and t.transcription.strip()]
+    return " ".join(parts) or None
+
+
+def derived_date(page: Page, photo: Photo) -> str | None:
+    """Camera date stamp first, then the first dated linked text."""
+    if photo.stamp and photo.stamp.date:
+        return photo.stamp.date
+    return next((t.date for t in page.linked_texts(photo.id) if t.date), None)
+
+
+def effective_caption(page: Page, photo: Photo) -> str | None:
+    """The reviewer's caption if set ("" clears it), else the derived one."""
+    return derived_caption(page, photo) if photo.caption is None else (photo.caption or None)
+
+
+def effective_date(page: Page, photo: Photo) -> str | None:
+    return derived_date(page, photo) if photo.date is None else (photo.date or None)
 
 
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")

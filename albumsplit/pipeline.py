@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
+import json
+
 import cv2
 
 from . import __version__
@@ -26,6 +28,7 @@ class Result:
     page_id: str
     skipped: bool
     page: Page | None = None
+    skip_reason: str = ""  # "approved" or "edited" when skipped
     llm: LlmStatus = "off"
 
 
@@ -37,6 +40,24 @@ def debug_path(work_dir: Path, page_id: str) -> Path:
     return work_dir / "debug" / f"{page_id}.jpg"
 
 
+def workdir_config_path(work_dir: Path) -> Path:
+    return work_dir / "workdir.json"
+
+
+def save_input_dir(work_dir: Path, input_dir: Path) -> None:
+    """Remember where the scans are, so review and export can find the source images."""
+    path = workdir_config_path(work_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"input_dir": str(input_dir)}, indent=2), encoding="utf-8")
+
+
+def load_input_dir(work_dir: Path) -> Path | None:
+    path = workdir_config_path(work_dir)
+    if not path.exists():
+        return None
+    return Path(json.loads(path.read_text(encoding="utf-8"))["input_dir"])
+
+
 def process_page(input_dir: Path, image_path: Path, work_dir: Path, *, force: bool = False,
                  debug: bool = True, params: Params | None = None,
                  page_id: str | None = None, llm: LlmLinker | None = None,
@@ -46,8 +67,12 @@ def process_page(input_dir: Path, image_path: Path, work_dir: Path, *, force: bo
     rel = image_path.relative_to(input_dir)
     page_id = page_id or page_id_from_path(rel)
     json_path = page_json_path(work_dir, page_id)
-    if json_path.exists() and not force and Page.load(json_path).status == "approved":
-        return Result(page_id, skipped=True)
+    if json_path.exists() and not force:
+        old = Page.load(json_path)
+        # Keep reviewed work: approved pages and pages changed in review.
+        if old.status == "approved" or old.edited:
+            return Result(page_id, skipped=True,
+                          skip_reason="approved" if old.status == "approved" else "edited")
 
     img = load_bgr(image_path)
     det = detect_page(img, params)

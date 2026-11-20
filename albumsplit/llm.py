@@ -23,7 +23,7 @@ import numpy as np
 
 from .debug import photo_color
 from .imageio import downscale
-from .model import Issue, Link, Page
+from .model import Issue, Link, Page, Photo, Point
 
 DEFAULT_MODEL = "claude-opus-5-5"
 ISSUE_KINDS = ("missed_caption", "missed_photo", "merged_photos", "bad_frame", "other")
@@ -110,6 +110,42 @@ SCHEMA: dict[str, Any] = {
 }
 
 
+STAMP_PROMPT_VERSION = 1
+STAMP_SYSTEM_PROMPT = """\
+You read the date that a film camera printed into a photo: small orange or red
+seven-segment digits, usually near a corner, such as 6 5 '95, '93 7 14 or 98 6 26. The
+order of day, month and year varies between cameras. The year has two digits, between
+'75 and '15. The print may lie rotated, so the stamp may run up or down the image.
+
+Answer:
+- found: true only if you can see such a camera-printed date in the photo. Handwriting,
+  signs, clocks or calendars in the scene are not date stamps.
+- text: the stamp exactly as printed, with the spaces and apostrophe, e.g. "6 5 '95".
+  Use ? for a digit you cannot read. Empty if not found.
+- date: the date as YYYY-MM-DD, or null if you cannot read it with confidence. When the
+  field order is ambiguous (e.g. 6 5 '95), choose the order that matches the camera dates
+  of other photos on the same page if they are given, otherwise day month year."""
+
+STAMP_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "found": {"type": "boolean"},
+        "text": {"type": "string"},
+        "date": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+    },
+    "required": ["found", "text", "date"],
+    "additionalProperties": False,
+}
+
+
+@dataclass
+class StampAnswer:
+    found: bool
+    text: str
+    date: str | None
+    model: str
+
+
 class LlmUnavailable(RuntimeError):
     """The SDK is missing or no credentials work: raised once, before any page is processed."""
 
@@ -175,12 +211,14 @@ class LlmLinker:
         except (anthropic.AnthropicError, TypeError) as e:  # TypeError: no credentials at all
             raise LlmUnavailable("no Anthropic credentials found: set ANTHROPIC_API_KEY") from e
 
-    def link(self, page: Page, img_bgr: np.ndarray, cache_dir: Path) -> LlmResult | None:
-        """Ask Claude about this page. None (with a warning) if no usable answer came back."""
+    def link(self, page: Page, img_bgr: np.ndarray, cache_dir: Path, *, force: bool = False
+             ) -> LlmResult | None:
+        """Ask Claude about this page. None (with a warning) if no usable answer came back.
+        `force` asks again even if an answer for exactly this request is cached."""
         # Called even for pages without text boxes: Claude may spot captions the detector missed.
         req = self.prepare(page, img_bgr)
         cache_path = cache_dir / f"{page.page_id}.json"
-        data = read_cache(cache_path, req.digest)
+        data = None if force else read_cache(cache_path, req.digest)
         cached = data is not None
         if data is None:
             data = self._call(page.page_id, req.content)
@@ -223,22 +261,68 @@ class LlmLinker:
         content.append({"type": "text", "text": prompt})
         return Request(page_id=page.page_id, content=content, digest=h.hexdigest())
 
-    def params(self, content: list[dict]) -> dict:
+    def params(self, content: list[dict], system: str = SYSTEM_PROMPT,
+               schema: dict[str, Any] = SCHEMA) -> dict:
         """Messages API parameters shared by the direct call and the Batch API."""
         return {
             "model": self.model,
             "max_tokens": 16000,
-            "system": [{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
+            "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
             "messages": [{"role": "user", "content": content}],
-            "output_config": {"format": {"type": "json_schema", "schema": SCHEMA}},
+            "output_config": {"format": {"type": "json_schema", "schema": schema}},
         }
 
-    def _call(self, page_id: str, content: list[dict]) -> dict | None:
+    def read_stamp(self, page: Page, photo: Photo, img_bgr: np.ndarray, cache_dir: Path, *,
+                   force: bool = False) -> StampAnswer | None:
+        """Ask Claude to read the date the camera printed into one photo. None (with a
+        warning) if no usable answer came back."""
+        content, digest = self.prepare_stamp(page, photo, img_bgr)
+        cache_path = cache_dir / "stamps" / f"{page.page_id}__P{photo.id}.json"
+        data = None if force else read_cache(cache_path, digest)
+        if data is None:
+            data = self._call(page.page_id, content, STAMP_SYSTEM_PROMPT, STAMP_SCHEMA)
+            if data is None:
+                return None
+            write_cache(cache_path, digest, self.model, data)
+        found = bool(data.get("found"))
+        return StampAnswer(found=found, text=(data.get("text") or "").strip() if found else "",
+                           date=normalize_date(data.get("date")) if found else None,
+                           model=self.model)
+
+    def prepare_stamp(self, page: Page, photo: Photo, img_bgr: np.ndarray
+                      ) -> tuple[list[dict], str]:
+        """Content blocks for a stamp read, plus a hash of everything sent (the cache key)."""
+        h = hashlib.sha256()
+        h.update(f"{self.model}|stamp{STAMP_PROMPT_VERSION}|".encode())
+        h.update(json.dumps(STAMP_SCHEMA, sort_keys=True).encode())
+        whole = _encode(downscale(warp_quad(img_bgr, photo.corners), PAGE_LONG_SIDE)[0])
+        h.update(whole)
+        content: list[dict] = [{"type": "text", "text": "The photo:"}, _image(whole)]
+        st = photo.stamp
+        if st is not None:
+            zoom = _encode(stamp_zoom(img_bgr, st.corners))
+            h.update(zoom)
+            content += [{"type": "text", "text": "Close-up of where a detector found the stamp, "
+                                                 "turned to reading direction:"}, _image(zoom)]
+        others = sorted({p.stamp.date for p in page.photos
+                         if p.id != photo.id and p.stamp and p.stamp.date})
+        lines = []
+        if st is not None and st.text:
+            lines.append(f'An OCR read of the stamp: "{st.text}" (may be wrong).')
+        if others:
+            lines.append("Camera dates read on other photos of this album page: " + ", ".join(others))
+        prompt = "\n".join(lines + ["Read the date stamp."])
+        h.update(prompt.encode())
+        content.append({"type": "text", "text": prompt})
+        return content, h.hexdigest()
+
+    def _call(self, page_id: str, content: list[dict], system: str = SYSTEM_PROMPT,
+              schema: dict[str, Any] = SCHEMA) -> dict | None:
         a = self._anthropic
         try:
             # Server-side refusal fallback; the Batch API does not accept it, so only here.
             resp = self.client.beta.messages.create(
-                **self.params(content),
+                **self.params(content, system, schema),
                 betas=["server-side-fallback-2026-07-01"],
                 fallbacks="default",
             )
@@ -387,6 +471,33 @@ def text_crop(t, img_bgr: np.ndarray, photos=()) -> np.ndarray:
         crop[on_photo > 0] = 255
     small, _ = downscale(crop, CROP_LONG_SIDE)
     return small
+
+
+def warp_quad(img_bgr: np.ndarray, quad: list[Point]) -> np.ndarray:
+    """Perspective-corrected crop of a quad given as TL, TR, BR, BL."""
+    q = np.array(quad, np.float32)
+    w = int(round(max(np.linalg.norm(q[1] - q[0]), np.linalg.norm(q[2] - q[3]))))
+    h = int(round(max(np.linalg.norm(q[3] - q[0]), np.linalg.norm(q[2] - q[1]))))
+    w, h = max(w, 1), max(h, 1)
+    dst = np.array([(0, 0), (w - 1, 0), (w - 1, h - 1), (0, h - 1)], np.float32)
+    M = cv2.getPerspectiveTransform(q, dst)
+    return cv2.warpPerspective(img_bgr, M, (w, h), flags=cv2.INTER_AREA,
+                               borderMode=cv2.BORDER_REPLICATE)
+
+
+def stamp_zoom(img_bgr: np.ndarray, corners: list[Point], grow_w: float = 1.6,
+               grow_h: float = 2.4, min_h: int = 160) -> np.ndarray:
+    """The stamp quad with some surroundings, upright and enlarged so the digits are legible."""
+    q = np.array(corners, np.float32)
+    c = q.mean(axis=0)
+    u = ((q[1] - q[0]) + (q[2] - q[3])) / 2 * grow_w / 2  # half-width along the text
+    v = ((q[3] - q[0]) + (q[2] - q[1])) / 2 * grow_h / 2  # half-height down the text
+    big = [tuple(c - u - v), tuple(c + u - v), tuple(c + u + v), tuple(c - u + v)]
+    crop = warp_quad(img_bgr, big)
+    if crop.shape[0] < min_h:
+        f = min_h / crop.shape[0]
+        crop = cv2.resize(crop, None, fx=f, fy=f, interpolation=cv2.INTER_CUBIC)
+    return crop
 
 
 def _encode(img: np.ndarray) -> bytes:

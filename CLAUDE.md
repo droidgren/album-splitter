@@ -55,6 +55,26 @@ Output: `<work_dir>/pages/<page_id>.json` with `photos[]`, `texts[]`, `links[]`,
 - Editable transcription/date fields per photo (prefilled if LLM was used).
 - Saves to the page JSON on every change.
 
+Implemented in `albumsplit/review/` (vanilla JS, no build step/CDN). Notes:
+- `review` without a work dir (or `review.bat` with no args) opens a **start page**
+  (`static/start.html`): pick the scan and work folders with a server-side folder browser,
+  run detection as a background job (`review/jobs.py`, optional Claude), then start review.
+  Recent projects live in `~/.albumsplit/recent.json`. The work folder may not be inside the scans.
+- Scans are found via `<work_dir>/workdir.json` (written by detect); `--input` overrides it
+  (Docker: `review /work --input /scans --host 0.0.0.0`). Previews are cached in `<work_dir>/preview/`.
+- **L** / "Ask Claude" re-runs the LLM linking+transcription on the current page as edited
+  (always a fresh call). "Read stamp with Claude" per photo sends the rectified photo plus an
+  upright zoom of the stamp (`llm.read_stamp`); the answer replaces `stamp.date` (old OCR dates
+  move to `date_alts`, `stamp.reader = "llm:<model>"`), or sets `photo.date` if no stamp box.
+  Both are cached under `<work_dir>/llm/` and undoable with Ctrl+Z.
+- `photos[].caption` / `photos[].date` are reviewer overrides; `None` = derive from the linked
+  texts and the stamp (`model.effective_caption` / `effective_date`, which export must use).
+  Derived captions are flattened to one line (`model.flatten_caption`: line breaks -> spaces,
+  "svinhus-\ntaket" -> "svinhustaket"); `texts[].transcription` keeps the line breaks as written.
+- Every save sets `page.edited`; detect skips edited and approved pages unless `--force`.
+- On save, `review/geometry.normalize` drops dangling links, clears the outline and `needs_review` of
+  moved photos, and recomputes `texts[].outline` for new/changed boxes.
+
 ### 3. Export (batch, CLI)
 `python -m albumsplit export <work_dir> --out <export_dir>` (approved pages only by default)
 

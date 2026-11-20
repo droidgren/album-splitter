@@ -12,7 +12,7 @@ from .detect import Params
 from .imageio import find_images
 from .llm import DEFAULT_MODEL
 from .model import assign_page_ids
-from .pipeline import process_page
+from .pipeline import load_input_dir, process_page, save_input_dir
 
 
 def cmd_detect(args: argparse.Namespace) -> int:
@@ -33,6 +33,7 @@ def cmd_detect(args: argparse.Namespace) -> int:
         print(e, file=sys.stderr)
         return 1
 
+    save_input_dir(work_dir, input_dir)
     params = Params(stamps=args.stamps)
     llm = queue = None
     if args.llm or args.llm_batch:
@@ -54,7 +55,8 @@ def cmd_detect(args: argparse.Namespace) -> int:
             print(f"[{i}/{len(images)}] {path.name}: ERROR {e}", file=sys.stderr)
             continue
         if res.skipped:
-            print(f"[{i}/{len(images)}] {res.page_id}: approved, skipped")
+            print(f"[{i}/{len(images)}] {res.page_id}: {res.skip_reason} in review, skipped"
+                  f" (--force re-detects)")
             continue
         pg = res.page
         review = sum(p.needs_review for p in pg.photos)
@@ -135,6 +137,36 @@ def cmd_llm_collect(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_review(args: argparse.Namespace) -> int:
+    try:
+        import uvicorn
+
+        from .review import create_app
+    except ImportError as e:
+        print(f"review needs fastapi and uvicorn (pip install -r requirements.txt): {e}",
+              file=sys.stderr)
+        return 1
+    work_dir = input_dir = None
+    if args.work_dir:
+        work_dir = Path(args.work_dir).resolve()
+        input_dir = Path(args.input).resolve() if args.input else load_input_dir(work_dir)
+        if input_dir is not None and not input_dir.is_dir():
+            print(f"Scan folder {input_dir} not found; pass --input", file=sys.stderr)
+            return 1
+    app = create_app(work_dir, input_dir, llm_model=args.llm_model)
+    base = f"http://{'localhost' if args.host in ('127.0.0.1', '0.0.0.0') else args.host}:{args.port}"
+    # Straight into review when the project is known, else the start page to choose one.
+    url = base + ("/review" if work_dir and input_dir and (work_dir / "pages").is_dir() else "/")
+    where = f"{work_dir} (scans in {input_dir})" if work_dir and input_dir else "start page"
+    print(f"albumsplit: {where} at {base}/  - Ctrl+C stops")
+    if args.open if args.open is not None else args.host != "0.0.0.0":
+        import threading
+        import webbrowser
+        threading.Timer(1.0, webbrowser.open, [url]).start()
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="albumsplit")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -143,7 +175,8 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("input_dir")
     d.add_argument("--out", required=True, help="work directory")
     d.add_argument("--only", help="only process files whose name matches this glob")
-    d.add_argument("--force", action="store_true", help="re-detect pages that are already approved")
+    d.add_argument("--force", action="store_true",
+                   help="re-detect pages that were approved or edited in review")
     d.add_argument("--debug", action=argparse.BooleanOptionalAction, default=True,
                    help="write debug images to <work_dir>/debug (default: on)")
     d.add_argument("--stamps", action=argparse.BooleanOptionalAction, default=True,
@@ -162,6 +195,17 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--debug", action=argparse.BooleanOptionalAction, default=True,
                    help="re-render debug images of updated pages (default: on)")
     c.set_defaults(func=cmd_llm_collect)
+
+    r = sub.add_parser("review", help="start page and page review in the browser")
+    r.add_argument("work_dir", nargs="?", help="open this work folder (default: choose on the start page)")
+    r.add_argument("--input", help="scan directory (default: the one detect used)")
+    r.add_argument("--llm-model", default=DEFAULT_MODEL,
+                   help=f"Claude model for re-reading pages and stamps (default: {DEFAULT_MODEL})")
+    r.add_argument("--host", default="127.0.0.1", help="use 0.0.0.0 to reach it from other machines")
+    r.add_argument("--port", type=int, default=8000)
+    r.add_argument("--open", action=argparse.BooleanOptionalAction, default=None,
+                   help="open a browser (default: on unless --host 0.0.0.0)")
+    r.set_defaults(func=cmd_review)
 
     args = ap.parse_args(argv)
     return args.func(args)

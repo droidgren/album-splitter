@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>albumsplit review</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header id="bar">
+  <a id="home" href="/" title="Start page: folders and detection">⌂</a>
+  <button id="prev" title="Previous page (←)">◀</button>
+  <select id="jump" title="Jump to page"></select>
+  <button id="next" title="Next page (→)">▶</button>
+  <span id="pos"></span>
+  <span id="status-badge"></span>
+  <span id="progress"></span>
+  <span class="spacer"></span>
+  <span id="save-state" title="Save state">●</span>
+  <button id="ask" title="Ask Claude to read and link the captions on this page again (L)">Ask Claude (L)</button>
+  <button id="approve" title="Approve and go to the next page (Enter)">Approve ⏎</button>
+</header>
+<main>
+  <div id="stage"><canvas id="canvas"></canvas><div id="hint"></div><div id="busy" hidden></div></div>
+  <aside id="panel"></aside>
+</main>
+<footer id="keys">
+  <b>Enter</b> approve + next · <b>←/→</b> prev/next · <b>N</b> next unreviewed · <b>U</b> un-approve · <b>L</b> ask Claude ·
+  click text then photo (or photo then text) = link/unlink · <b>Ctrl</b>+click select only ·
+  drag = new text · <b>Shift</b>+drag = new photo · drag corners/inside selected = adjust ·
+  <b>Del</b> remove · <b>Esc</b> deselect · <b>Ctrl+Z</b> undo · wheel zoom · right/middle-drag or
+  <b>Space</b>+drag pan · <b>0</b> fit
+</footer>
+<script src="app.js"></script>
+</body>
+</html>

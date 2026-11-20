@@ -1177,7 +1177,8 @@ def detect_texts(lab: np.ndarray, paper: np.ndarray, photo_mask: np.ndarray,
     return merged
 
 
-def _text_outline(box: tuple[int, int, int, int], photo_mask: np.ndarray) -> np.ndarray | None:
+def _text_outline(box: tuple[int, int, int, int], photo_mask: np.ndarray,
+                  epsilon: float = 2.0) -> np.ndarray | None:
     """The paper part of a text box that runs onto a photo, as a polygon (else None).
 
     A caption may wrap around a print's corner: one line above it, the rest beside it. Its
@@ -1193,7 +1194,7 @@ def _text_outline(box: tuple[int, int, int, int], photo_mask: np.ndarray) -> np.
     if not cs:
         return None
     c = max(cs, key=cv2.contourArea)
-    poly = cv2.approxPolyDP(c, 2.0, True).reshape(-1, 2).astype(np.float32)
+    poly = cv2.approxPolyDP(c, epsilon, True).reshape(-1, 2).astype(np.float32)
     return poly + np.array([x - 1, y - 1], np.float32)
 
 

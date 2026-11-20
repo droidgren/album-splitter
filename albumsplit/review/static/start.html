@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>albumsplit</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="start.css">
+</head>
+<body>
+<header><h1>albumsplit</h1><span>Crop photos from scanned album pages and keep their captions</span></header>
+<main>
+  <section id="recent-box" hidden>
+    <h2>Recent</h2>
+    <div id="recent"></div>
+  </section>
+
+  <section>
+    <h2>Folders</h2>
+    <label for="input-dir">Scans <small>(read only, never changed)</small></label>
+    <div class="row"><input id="input-dir" type="text" placeholder="Folder with the scanned pages (JPG, PNG, TIFF)">
+      <button data-browse="input-dir">Browse…</button></div>
+    <label for="work-dir">Work folder <small>(page files, previews and debug images go here)</small></label>
+    <div class="row"><input id="work-dir" type="text" placeholder="Folder for albumsplit's own files">
+      <button data-browse="work-dir">Browse…</button></div>
+    <div class="row end"><span id="open-msg" class="msg"></span><button id="open" class="primary">Open</button></div>
+  </section>
+
+  <section id="project" hidden>
+    <h2>Project</h2>
+    <div id="stats" class="stats"></div>
+
+    <h3>1. Detect</h3>
+    <p class="muted">Finds the photos, captions and camera date stamps on scans that have no page file yet.
+      Pages you have edited or approved are kept, except with <b>Re-detect all</b>, which starts every page over.</p>
+    <label class="check"><input id="opt-llm" type="checkbox"> Read and link the captions with Claude
+      <small id="llm-note"></small></label>
+    <label class="check"><input id="opt-redo" type="checkbox"> Also re-detect pages that are not yet reviewed</label>
+    <div class="row"><button id="detect" class="primary">Detect</button><button id="cancel" hidden>Cancel</button>
+      <button id="redetect-all" class="danger" title="Detect every scan again, including pages you have edited or approved">Re-detect all…</button>
+      <span id="detect-msg" class="msg"></span></div>
+    <div id="progress" hidden><div class="bar"><div id="bar-fill"></div></div><div id="progress-text"></div>
+      <pre id="log"></pre></div>
+
+    <h3>2. Review</h3>
+    <div class="row"><button id="review" class="primary">Start review →</button>
+      <span id="review-msg" class="msg"></span></div>
+  </section>
+</main>
+
+<dialog id="browser">
+  <form method="dialog">
+    <h2 id="browser-title">Choose folder</h2>
+    <div class="row"><button type="button" id="up" title="Parent folder">↑</button>
+      <input id="browser-path" type="text"><button type="button" id="go">Go</button></div>
+    <ul id="dirs"></ul>
+    <div class="row"><span id="browser-info" class="muted"></span><span class="spacer"></span>
+      <button type="button" id="new-folder" title="Use a new sub-folder of this one (created on Open)">New folder…</button>
+      <button value="cancel">Cancel</button><button type="button" id="choose" class="primary">Use this folder</button></div>
+  </form>
+</dialog>
+<script src="start.js"></script>
+</body>
+</html>

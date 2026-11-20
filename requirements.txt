@@ -2,3 +2,5 @@ opencv-python-headless>=4.10
 numpy>=1.26
 pillow>=10.0
 anthropic>=2.11  # only used with detect --llm
+fastapi>=0.115  # review UI
+uvicorn>=0.30
