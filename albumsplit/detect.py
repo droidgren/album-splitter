@@ -801,7 +801,8 @@ def _push_side(new: dict, key: str, step: int, axes: dict, line, c: np.ndarray,
                         vals.append(abs(gx[qy, qx] * along[0] + gy[qy, qx] * along[1]))
                 if vals:
                     best = max(best, float(np.median(vals)))
-            edges.append(best >= 1.5 * p.snap_min_grad)
+            edges.append(best >= 1.5 * p.snap_min_grad
+                         and _paper_beyond(c, n_side, along, pos, a, paperlike))
         tinted = False
         if lab is not None and any(edges):
             bx, by = [], []
@@ -824,6 +825,25 @@ def _push_side(new: dict, key: str, step: int, axes: dict, line, c: np.ndarray,
             if miss > 6:
                 break  # the side edges have ended: this is the print's border
     return last_ok if last_ok >= 4 else 0
+
+
+def _paper_beyond(c: np.ndarray, n_side: np.ndarray, along: np.ndarray, pos: float, a: float,
+                  paperlike: np.ndarray) -> bool:
+    """Is there paper just outside the side line at `a`, around position `pos` of the pushed
+    side? A print's own edge has paper beyond it. A neighbouring print lying flush against
+    this one continues the side line with *its* edge, and has print content beyond it; that
+    must not count as this print going on (a caption under a print between two neighbours
+    would otherwise be swallowed)."""
+    h, w = paperlike.shape
+    out = 1.0 if a >= 0 else -1.0
+    vals = []
+    for k in range(-4, 5, 2):
+        for d in range(4, 11, 2):
+            q = c + n_side * (pos + k) + along * (a + out * d)
+            qx, qy = int(round(q[0])), int(round(q[1]))
+            if 0 <= qx < w and 0 <= qy < h:
+                vals.append(paperlike[qy, qx])
+    return not vals or float(np.mean(vals)) >= 0.5
 
 
 def _framed_by_edges(rect: tuple, grad: tuple[np.ndarray, np.ndarray], p: Params) -> bool:
