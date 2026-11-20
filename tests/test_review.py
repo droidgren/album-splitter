@@ -405,6 +405,7 @@ def _two_scan_project(tmp_path: Path):
 class FakeBatches:
     created: list = []
     status = "in_progress"
+    answer: dict = {"texts": [], "issues": []}
 
     def create(self, requests):
         from types import SimpleNamespace as NS
@@ -421,7 +422,7 @@ class FakeBatches:
 
     def results(self, bid):
         from types import SimpleNamespace as NS
-        answer = json.dumps({"texts": [], "issues": []})
+        answer = json.dumps(FakeBatches.answer)
         for item in FakeBatches.created[int(bid[5:]) - 1]:
             msg = NS(stop_reason="end_turn", content=[NS(type="text", text=answer)])
             yield NS(custom_id=item["custom_id"], result=NS(type="succeeded", message=msg))
@@ -540,3 +541,84 @@ def test_edited_only_for_real_changes(env):
     d["links"] = d["links"] + [{"text_id": 1, "photo_id": 2}]
     assert client.put("/api/pages/p1", json=d).json()["edited"] is True   # a real change
     assert Page.load(page_json_path(work, "p1")).edited
+
+
+# ---------- only ask Claude again (keep frames, boxes and links) ----------
+
+def test_apply_keep_links():
+    from albumsplit.llm import LlmResult, TextAnswer, apply
+    page = Page(page_id="p", source="p.jpg", width=10, height=10,
+                photos=[Photo(id=1, corners=quad(0, 0, 4, 4)), Photo(id=2, corners=quad(5, 0, 9, 4))],
+                texts=[TextBlock(id=1, box=(0, 5, 4, 2), transcription="old"),
+                       TextBlock(id=2, box=(5, 5, 4, 2))],
+                links=[Link(1, 1)])
+    res = LlmResult(texts=[TextAnswer(1, True, [2], "Påsk -84", "1984-04-22"),
+                           TextAnswer(2, True, [1, 2], "Mormor", None)],
+                    issues=[], model="m", cached=False)
+    apply(page, res, keep_links=True)
+    # T1 keeps the person's link to P1; T2 had none and gets Claude's.
+    assert sorted((lk.text_id, lk.photo_id) for lk in page.links) == [(1, 1), (2, 1), (2, 2)]
+    assert page.texts[0].transcription == "Påsk -84" and page.texts[0].date == "1984-04-22"
+    assert page.texts[1].transcription == "Mormor" and page.linker == "llm:m"
+
+
+class FakeAllTexts(FakeLinker):
+    """Answers for every text on the page: each one about photo 2."""
+
+    def link(self, page, img, cache_dir, *, force=False):
+        from albumsplit.llm import LlmResult, TextAnswer
+        FakeLinker.calls.append(("link", page.page_id, force))
+        return LlmResult(texts=[TextAnswer(t.id, True, [2], f"text {t.id}", None) for t in page.texts],
+                         issues=[], model=self.model, cached=False)
+
+
+def _claude_only_setup(env):
+    client, work, scans = env
+    client.post("/api/project", json={"work_dir": str(work), "input_dir": str(scans)})
+    path = page_json_path(work, "p1")
+    page = Page.load(path)
+    page.texts.append(TextBlock(id=3, box=(2200, 1650, 900, 120)))  # a box drawn in review
+    page.edited = True
+    page.save(path)
+    # A second, approved page must be left alone.
+    other = Page.load(path)
+    other.page_id, other.status = "p2", "approved"
+    other.save(page_json_path(work, "p2"))
+    return client, work, page
+
+
+def test_claude_only_now_keeps_boxes_and_links(env, monkeypatch):
+    monkeypatch.setattr("albumsplit.llm.LlmLinker", FakeAllTexts)
+    FakeLinker.calls = []
+    client, work, before = _claude_only_setup(env)
+    st = _run_detect(client, {"claude_only": True, "batch": False})
+    assert st["state"] == "finished" and st["claude_only"], st
+    assert st["total"] == 1 and st["detected"] == 1, st          # only the unapproved page
+    assert [c[1] for c in FakeLinker.calls] == ["p1"]
+    after = Page.load(page_json_path(work, "p1"))
+    assert [t.box for t in after.texts] == [t.box for t in before.texts]   # no new detection
+    assert [p.corners for p in after.photos] == [p.corners for p in before.photos]
+    # T1 -> P1 and T2 -> P2 were on the page and stay; the new T3 gets Claude's link.
+    assert sorted((lk.text_id, lk.photo_id) for lk in after.links) == [(1, 1), (2, 2), (3, 2)]
+    assert [t.transcription for t in after.texts] == ["text 1", "text 2", "text 3"]
+    assert after.edited and after.linker.startswith("llm:")
+    assert Page.load(page_json_path(work, "p2")).linker == "heuristic"
+
+
+def test_claude_only_batch_updates_edited_pages(env, monkeypatch):
+    FakeBatches.created, FakeBatches.status = [], "in_progress"
+    monkeypatch.setattr(FakeBatches, "answer", {"texts": [
+        {"id": 1, "is_caption": True, "photo_ids": [2], "transcription": "Påsk", "date": None},
+        {"id": 3, "is_caption": True, "photo_ids": [2], "transcription": "Ny", "date": "1990"}],
+        "issues": []})
+    monkeypatch.setattr("albumsplit.llm.LlmLinker", _fake_batch_linker())
+    client, work, _ = _claude_only_setup(env)
+    st = _run_detect(client, {"claude_only": True, "batch": True})
+    assert st["queued"] == 1 and st["batches"] == ["batch1"], st
+    assert Page.load(page_json_path(work, "p1")).linker == "heuristic"  # not yet
+    FakeBatches.status = "ended"
+    r = client.post("/api/batches/collect").json()
+    assert r["updated"] == 1, r  # the page is edited, but this batch keeps links: applied
+    after = Page.load(page_json_path(work, "p1"))
+    assert sorted((lk.text_id, lk.photo_id) for lk in after.links) == [(1, 1), (2, 2), (3, 2)]
+    assert after.texts[0].transcription == "Påsk" and after.texts[2].date == "1990"

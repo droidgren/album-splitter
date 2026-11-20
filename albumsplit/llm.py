@@ -399,21 +399,27 @@ def _validate_issues(page: Page, data: dict) -> list[Issue]:
     return out
 
 
-def apply(page: Page, result: LlmResult) -> None:
+def apply(page: Page, result: LlmResult, *, keep_links: bool = False) -> None:
     """Replace the heuristic links and fill in transcription/date for texts Claude answered.
-    Record the reported issues and flag the photos they concern for review."""
+    Record the reported issues and flag the photos they concern for review.
+
+    With `keep_links`, links already on the page stay as they are (a person may have set
+    them) and Claude's links are only used for texts that have none yet.
+    """
     page.issues = [i for i in page.issues if i.source != "llm"] + result.issues
     photos = {p.id: p for p in page.photos}
     for issue in result.issues:
         for pid in issue.photo_ids:
             photos[pid].needs_review = True
     answered = {a.id: a for a in result.texts}
-    page.links = [lk for lk in page.links if lk.text_id not in answered]
+    linked = {lk.text_id for lk in page.links} if keep_links else set()
+    page.links = [lk for lk in page.links if lk.text_id in linked or lk.text_id not in answered]
     for t in page.texts:
         a = answered.get(t.id)
         if a is None:
             continue
-        page.links.extend(Link(text_id=t.id, photo_id=pid) for pid in a.photo_ids)
+        if t.id not in linked:
+            page.links.extend(Link(text_id=t.id, photo_id=pid) for pid in a.photo_ids)
         t.transcription = a.transcription or None
         t.date = a.date
     page.links.sort(key=lambda lk: (lk.text_id, lk.photo_id))

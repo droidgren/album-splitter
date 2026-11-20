@@ -67,6 +67,10 @@ Implemented in `albumsplit/review/` (vanilla JS, no build step/CDN). Notes:
   saved with heuristic links at once, the start page polls `/api/batches` every minute and applies
   answers when a batch ends) and **Now** (direct calls). Batch results never overwrite pages that
   were approved or edited in review meanwhile; their answers stay in the `llm/` cache.
+- **Only ask Claude again** (`claude_only`): no detection; every page not approved, edited ones
+  included, is sent as it is now. `llm.apply(keep_links=True)` keeps the links on the page and
+  only links texts without one; transcriptions/dates are replaced. Uses the cache, so an
+  unchanged page costs nothing. Batches carry `keep_links` in `llm/batches.json`.
 - Scans are found via `<work_dir>/workdir.json` (written by detect); `--input` overrides it
   (Docker: `review /work --input /scans --host 0.0.0.0`). Previews are cached in `<work_dir>/preview/`.
 - **L** / "Ask Claude" re-runs the LLM linking+transcription on the current page as edited

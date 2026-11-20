@@ -44,6 +44,9 @@
         start reviewing meanwhile)</small></label>
       <label class="check"><input type="radio" name="llm-mode" value="now">
         <b>Now</b>: full price, each page is read during detection</label>
+      <label class="check"><input id="opt-claude-only" type="checkbox"> <b>Only ask Claude again</b>: no new detection;
+        keeps your frames, text boxes and links <small>(Claude reads every text again and links only texts without
+        a link, e.g. a box you drew; approved pages are left alone; a page Claude already read unchanged costs nothing)</small></label>
     </div>
     <label class="check"><input id="opt-redo" type="checkbox"> Also redo pages I haven't changed or approved yet</label>
     <div class="row"><button id="detect" class="primary">Detect</button><button id="cancel" hidden>Cancel</button>

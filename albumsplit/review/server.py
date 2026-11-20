@@ -266,10 +266,13 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
     def start_detect(body: dict = Body(default={})) -> dict:
         work, inp = project()
         busy()
-        llm = linker() if body.get("llm") else None
+        claude_only = bool(body.get("claude_only"))
+        use_llm = bool(body.get("llm")) or claude_only
+        llm = linker() if use_llm else None
         st["job"] = DetectJob(input_dir=inp, work_dir=work, redo=bool(body.get("redo")),
-                              force=bool(body.get("force")), llm=llm,
-                              batch=bool(body.get("llm") and body.get("batch")))
+                              force=bool(body.get("force")) and not claude_only, llm=llm,
+                              batch=bool(use_llm and body.get("batch")),
+                              claude_only=claude_only, page_lock=lock)
         st["job"].start()
         return project_info()
 

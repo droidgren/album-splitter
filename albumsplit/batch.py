@@ -57,6 +57,9 @@ class BatchQueue:
     input_dir: Path
     submitted: list[str] = field(default_factory=list)
     log: Callable[[str], None] = print
+    # Claude-only re-read of reviewed pages: answers keep the links on the page and are
+    # applied to pages edited in review too (only approved pages are left alone).
+    keep_links: bool = False
     queued: int = 0  # requests added (and not deduplicated) so far
     _items: list[dict] = field(default_factory=list)
     _pages: dict[str, str] = field(default_factory=dict)  # custom_id -> page_id
@@ -82,7 +85,8 @@ class BatchQueue:
         state = load_state(self.work_dir)
         state["batches"].append({"id": batch.id, "model": self.linker.model,
                                  "input_dir": str(self.input_dir), "pages": self._pages,
-                                 "collected": False, "submitted": time.time()})
+                                 "collected": False, "submitted": time.time(),
+                                 "keep_links": self.keep_links})
         save_state(self.work_dir, state)
         self.log(f"  submitted batch {batch.id} ({len(self._items)} pages, "
                  f"{self._bytes / 1e6:.0f} MB)")
@@ -150,7 +154,8 @@ def collect(linker: LlmLinker, work_dir: Path, *, debug: bool = True,
             write_cache(work_dir / "llm" / f"{page_id}.json", r.custom_id, linker.model, data)
             got.append(page_id)
         for page_id in got:
-            if _apply_cached(linker, work_dir, Path(entry["input_dir"]), page_id, debug, log):
+            if _apply_cached(linker, work_dir, Path(entry["input_dir"]), page_id, debug, log,
+                             keep_links=entry.get("keep_links", False)):
                 updated += 1
             else:
                 failed += 1
@@ -160,7 +165,8 @@ def collect(linker: LlmLinker, work_dir: Path, *, debug: bool = True,
 
 
 def _apply_cached(linker: LlmLinker, work_dir: Path, input_dir: Path, page_id: str,
-                  debug: bool, log: Callable[[str], None] = print) -> bool:
+                  debug: bool, log: Callable[[str], None] = print, *,
+                  keep_links: bool = False) -> bool:
     from .pipeline import debug_path, page_json_path
     json_path = page_json_path(work_dir, page_id)
     try:
@@ -171,7 +177,7 @@ def _apply_cached(linker: LlmLinker, work_dir: Path, input_dir: Path, page_id: s
     if page.status == "approved":
         log(f"  {page_id}: approved meanwhile, not changed")
         return False
-    if page.edited:  # links and transcriptions would overwrite what was done in review
+    if page.edited and not keep_links:  # Claude's links would overwrite what was done in review
         log(f"  {page_id}: edited in review meanwhile, not changed (press L there to ask Claude)")
         return False
     img = load_bgr(input_dir / page.source)
@@ -179,7 +185,7 @@ def _apply_cached(linker: LlmLinker, work_dir: Path, input_dir: Path, page_id: s
     if res is None:  # page was re-detected after the request was sent
         log(f"  {page_id}: page changed since it was sent, llm answer not applied")
         return False
-    apply(page, res)
+    apply(page, res, keep_links=keep_links)
     page.save(json_path)
     if debug:
         out = debug_path(work_dir, page_id)

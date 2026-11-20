@@ -114,11 +114,30 @@ function updateExportButton(s) {
   else if (!exportRunning) msg("export-msg", "");
 }
 
+const claudeOnly = () => $("opt-llm").checked && $("opt-claude-only").checked;
+let detectRunning = false;
+
 function updateDetectButton(s) {
+  syncOptions();
+  if (claudeOnly()) {
+    const n = s.pages - s.approved;
+    $("detect").textContent = n ? `Ask Claude about ${n} page${n === 1 ? "" : "s"}` : "Ask Claude";
+    $("detect").dataset.n = n;
+    return;
+  }
   const redo = $("opt-redo").checked;
   const n = redo ? (s.new || 0) + (s.pages - s.approved - s.edited) : s.new;
   $("detect").textContent = n ? `Detect ${n} page${n === 1 ? "" : "s"}` : "Detect";
   $("detect").dataset.n = n || 0;
+}
+
+// Options that do not apply grey out: Batch/Now without Claude; redo and Re-detect all when
+// only Claude is asked again.
+function syncOptions() {
+  $("llm-mode").classList.toggle("off", !$("opt-llm").checked);
+  $("opt-redo").disabled = claudeOnly();
+  $("opt-redo").parentElement.classList.toggle("muted", claudeOnly());
+  $("redetect-all").disabled = detectRunning || claudeOnly();
 }
 
 // ---------- detection ----------
@@ -126,8 +145,9 @@ function updateDetectButton(s) {
 async function startDetect(force = false) {
   msg("detect-msg", "");
   try {
+    const only = claudeOnly() && !force;
     const proj = await post("/api/detect", { llm: $("opt-llm").checked, batch: llmMode() === "batch",
-      redo: $("opt-redo").checked, force });
+      redo: $("opt-redo").checked && !only, force, claude_only: only });
     renderProject(proj);
     poll();
   } catch (e) { msg("detect-msg", e.message, true); }
@@ -152,11 +172,13 @@ async function poll() {
   const running = st.state === "starting" || st.state === "running";
   $("progress").hidden = false;
   $("detect").disabled = running;
-  $("redetect-all").disabled = running;
+  detectRunning = running;
+  syncOptions();
   $("cancel").hidden = !running;
   $("bar-fill").style.width = st.total ? `${(100 * st.done) / st.total}%` : "0";
   const eta = st.done && running ? Math.round((st.elapsed / st.done) * (st.total - st.done)) : 0;
-  $("progress-text").textContent = `${st.done} / ${st.total}: ${st.detected} detected, ${st.skipped} skipped`
+  $("progress-text").textContent = `${st.done} / ${st.total}: ${st.detected} `
+    + `${st.claude_only ? "read by Claude" : "detected"}, ${st.skipped} skipped`
     + (st.failed ? `, ${st.failed} failed` : "") + (st.queued ? `, ${st.queued} queued for Claude` : "")
     + (st.current && running ? ` · ${st.current}` : "")
     + (eta ? ` · about ${fmtTime(eta)} left` : "") + (running ? "" : ` · ${st.state}`)
@@ -339,7 +361,9 @@ $("detect").addEventListener("click", () => startDetect(false));
 $("redetect-all").addEventListener("click", redetectAll);
 $("cancel").addEventListener("click", () => post("/api/detect/cancel").then(poll));
 $("opt-redo").addEventListener("change", () => api("/api/project").then((p) => p.stats && updateDetectButton(p.stats)));
-$("opt-llm").addEventListener("change", () => $("llm-mode").classList.toggle("off", !$("opt-llm").checked));
+for (const id of ["opt-llm", "opt-claude-only"]) {
+  $(id).addEventListener("change", () => { syncOptions(); if (stats) updateDetectButton(stats); });
+}
 $("llm-model").addEventListener("change", setModel);
 $("batch-check").addEventListener("click", () => { msg("batch-msg", "Checking…"); pollBatches().then(() => {
   if ($("batch-msg").textContent === "Checking…") msg("batch-msg", ""); }); });
