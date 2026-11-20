@@ -82,6 +82,16 @@ def render_debug(page: Page, img_bgr: np.ndarray, long_side: int = 1600) -> np.n
     n_stamps = sum(1 for ph in page.photos if ph.stamp)
     if n_stamps:
         summary += f", {n_stamps} date stamps"
+    if page.linker.startswith("llm"):
+        summary += " (llm)"
+    if page.issues:
+        # Kinds and photo ids only: notes may hold å/ä/ö, which Hershey fonts cannot draw.
+        line = "issues: " + ", ".join(
+            issue.kind + (f" (P{', P'.join(map(str, issue.photo_ids))})" if issue.photo_ids else "")
+            for issue in page.issues)
+        (tw, tht), base = cv2.getTextSize(line, font, 0.6, 2)
+        cv2.rectangle(canvas, (4, 4), (tw + 16, tht + base + 14), (40, 40, 200), cv2.FILLED)
+        cv2.putText(canvas, line, (10, tht + 9), font, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
     cv2.putText(canvas, summary, (10, canvas.shape[0] - 12), font, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
     cv2.putText(canvas, summary, (10, canvas.shape[0] - 12), font, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
     return canvas

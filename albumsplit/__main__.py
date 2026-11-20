@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .detect import Params
 from .imageio import find_images
+from .llm import DEFAULT_MODEL
 from .model import assign_page_ids
 from .pipeline import process_page
 
@@ -33,12 +34,21 @@ def cmd_detect(args: argparse.Namespace) -> int:
         return 1
 
     params = Params(stamps=args.stamps)
+    llm = queue = None
+    if args.llm or args.llm_batch:
+        llm = _make_linker(args.llm_model)
+        if llm is None:
+            return 1
+    if args.llm_batch:
+        from .batch import BatchQueue
+        queue = BatchQueue(llm, work_dir, input_dir)
     failures = 0
     for i, path in enumerate(images, 1):
         t0 = time.perf_counter()
         try:
             res = process_page(input_dir, path, work_dir, force=args.force, debug=args.debug,
-                               params=params, page_id=ids[path.relative_to(input_dir)])
+                               params=params, page_id=ids[path.relative_to(input_dir)], llm=llm,
+                               llm_queue=queue)
         except Exception as e:  # keep going on a bad scan
             failures += 1
             print(f"[{i}/{len(images)}] {path.name}: ERROR {e}", file=sys.stderr)
@@ -51,13 +61,78 @@ def cmd_detect(args: argparse.Namespace) -> int:
         unlinked = len({t.id for t in pg.texts} - {lk.text_id for lk in pg.links})
         stamps = [p.stamp for p in pg.photos if p.stamp]
         dated = sum(1 for st in stamps if st.date)
+        llm_note = ""
+        if res.llm == "failed":
+            llm_note = ", llm failed (heuristic kept)"
+        elif res.llm == "queued":
+            llm_note = ", llm queued"
+        elif res.llm != "off":
+            read = sum(1 for t in pg.texts if t.transcription)
+            llm_note = f", llm{' (cached)' if res.llm == 'cached' else ''}: {read} transcribed"
+            if pg.issues:
+                llm_note += f", {len(pg.issues)} issues"
         print(f"[{i}/{len(images)}] {res.page_id}: {len(pg.photos)} photos"
               f"{f' ({review} need review)' if review else ''}, {len(pg.texts)} texts, "
               f"{len(pg.links)} links{f', {unlinked} unlinked' if unlinked else ''}"
               f"{f', {len(stamps)} date stamps ({dated} read)' if stamps else ''}"
-              f"{', page outline' if pg.page_quad else ''}  ({time.perf_counter() - t0:.1f}s)")
+              f"{', page outline' if pg.page_quad else ''}{llm_note}  ({time.perf_counter() - t0:.1f}s)")
+        for issue in pg.issues:
+            where = f" (P{', P'.join(map(str, issue.photo_ids))})" if issue.photo_ids else ""
+            print(f"    ! {issue.kind}{where}: {issue.note}")
     print(f"Wrote {work_dir / 'pages'}" + (f" and {work_dir / 'debug'}" if args.debug else ""))
+    if queue is not None:
+        queue.flush()
+        if queue.submitted and not _wait_and_collect(llm, work_dir, queue.submitted, args.debug):
+            return 1
     return 1 if failures else 0
+
+
+def _make_linker(model: str):
+    from .llm import LlmLinker, LlmUnavailable
+    try:
+        return LlmLinker(model)
+    except LlmUnavailable as e:
+        print(f"--llm: {e}", file=sys.stderr)
+        return None
+
+
+def _wait_and_collect(llm, work_dir: Path, batch_ids: list[str], debug: bool) -> bool:
+    from .batch import collect, wait
+    print(f"Waiting for {len(batch_ids)} batch(es); usually under an hour, at most 24 h. "
+          f"Ctrl+C stops waiting, the batches keep running.")
+    try:
+        wait(llm, batch_ids)
+    except KeyboardInterrupt:
+        print(f"\nStopped waiting. Collect later with: python -m albumsplit llm-collect {work_dir}")
+        return False
+    updated, failed = collect(llm, work_dir, debug=debug)
+    print(f"LLM batch: {updated} pages updated" + (f", {failed} kept heuristic links" if failed else ""))
+    return True
+
+
+def cmd_llm_collect(args: argparse.Namespace) -> int:
+    from .batch import collect, pending_batches, wait
+    work_dir = Path(args.work_dir).resolve()
+    pending = pending_batches(work_dir)
+    if not pending:
+        print("No uncollected batches.")
+        return 0
+    for model in sorted({b["model"] for b in pending}):
+        llm = _make_linker(model)
+        if llm is None:
+            return 1
+        if args.wait:
+            try:
+                wait(llm, [b["id"] for b in pending if b["model"] == model])
+            except KeyboardInterrupt:
+                print("\nStopped waiting.")
+                return 1
+        updated, failed = collect(llm, work_dir, debug=args.debug)
+        print(f"{model}: {updated} pages updated" + (f", {failed} kept heuristic links" if failed else ""))
+    left = len(pending_batches(work_dir))
+    if left:
+        print(f"{left} batch(es) still running; run llm-collect again later or add --wait.")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -73,7 +148,20 @@ def main(argv: list[str] | None = None) -> int:
                    help="write debug images to <work_dir>/debug (default: on)")
     d.add_argument("--stamps", action=argparse.BooleanOptionalAction, default=True,
                    help="find and read camera date stamps inside the photos (default: on)")
+    d.add_argument("--llm", action="store_true",
+                   help="link and transcribe captions with Claude (needs ANTHROPIC_API_KEY)")
+    d.add_argument("--llm-model", default=DEFAULT_MODEL,
+                   help=f"Claude model for --llm (default: {DEFAULT_MODEL})")
+    d.add_argument("--llm-batch", action="store_true",
+                   help="like --llm, but through the Batch API: half price, results within 24 h")
     d.set_defaults(func=cmd_detect)
+
+    c = sub.add_parser("llm-collect", help="fetch finished --llm-batch results into the pages")
+    c.add_argument("work_dir")
+    c.add_argument("--wait", action="store_true", help="wait until all batches have ended")
+    c.add_argument("--debug", action=argparse.BooleanOptionalAction, default=True,
+                   help="re-render debug images of updated pages (default: on)")
+    c.set_defaults(func=cmd_llm_collect)
 
     args = ap.parse_args(argv)
     return args.func(args)

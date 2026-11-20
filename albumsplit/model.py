@@ -78,6 +78,18 @@ class Link:
     photo_id: int
 
 
+IssueKind = Literal["missed_caption", "missed_photo", "merged_photos", "bad_frame", "other"]
+
+
+@dataclass
+class Issue:
+    """A detection problem to fix in review, e.g. reported by the LLM pass."""
+    kind: IssueKind
+    note: str = ""
+    photo_ids: list[int] = field(default_factory=list)  # photos it concerns, if any
+    source: str = "llm"
+
+
 @dataclass
 class Page:
     page_id: str
@@ -88,8 +100,10 @@ class Page:
     texts: list[TextBlock] = field(default_factory=list)
     links: list[Link] = field(default_factory=list)
     page_quad: list[Point] | None = None  # page outline if the paper does not fill the frame
+    issues: list[Issue] = field(default_factory=list)
     status: Status = "proposed"
     detector_version: str = ""
+    linker: str = "heuristic"  # or "llm:<model>" when Claude linked and transcribed the texts
     schema_version: int = SCHEMA_VERSION
 
     def to_dict(self) -> dict:
@@ -117,8 +131,12 @@ class Page:
             ],
             links=[Link(**lk) for lk in d.get("links", [])],
             page_quad=[tuple(c) for c in d["page_quad"]] if d.get("page_quad") else None,
+            issues=[Issue(kind=i["kind"], note=i.get("note", ""),
+                          photo_ids=list(i.get("photo_ids", [])), source=i.get("source", "llm"))
+                    for i in d.get("issues", [])],
             status=d.get("status", "proposed"),
             detector_version=d.get("detector_version", ""),
+            linker=d.get("linker", "heuristic"),
             schema_version=d.get("schema_version", SCHEMA_VERSION),
         )
 

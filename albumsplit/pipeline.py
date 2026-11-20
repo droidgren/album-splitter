@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING, Literal
 
 import cv2
 
@@ -13,12 +14,19 @@ from .detect import Params, detect_page
 from .imageio import load_bgr
 from .model import Page, page_id_from_path
 
+if TYPE_CHECKING:
+    from .batch import BatchQueue
+    from .llm import LlmLinker
+
+LlmStatus = Literal["off", "called", "cached", "failed", "queued"]
+
 
 @dataclass
 class Result:
     page_id: str
     skipped: bool
     page: Page | None = None
+    llm: LlmStatus = "off"
 
 
 def page_json_path(work_dir: Path, page_id: str) -> Path:
@@ -31,7 +39,10 @@ def debug_path(work_dir: Path, page_id: str) -> Path:
 
 def process_page(input_dir: Path, image_path: Path, work_dir: Path, *, force: bool = False,
                  debug: bool = True, params: Params | None = None,
-                 page_id: str | None = None) -> Result:
+                 page_id: str | None = None, llm: LlmLinker | None = None,
+                 llm_queue: BatchQueue | None = None) -> Result:
+    """Detect one page. With `llm`, Claude links and transcribes it right away; with
+    `llm_queue` as well, the request is queued for the Batch API unless already cached."""
     rel = image_path.relative_to(input_dir)
     page_id = page_id or page_id_from_path(rel)
     json_path = page_json_path(work_dir, page_id)
@@ -52,9 +63,27 @@ def process_page(input_dir: Path, image_path: Path, work_dir: Path, *, force: bo
         status="proposed",
         detector_version=__version__,
     )
+    llm_status: LlmStatus = "off"
+    if llm is not None and llm_queue is not None:
+        from .llm import apply
+        res, req = llm.cached(page, img, work_dir / "llm")
+        if res is None:
+            llm_queue.add(req)
+            llm_status = "queued"
+        else:
+            apply(page, res)
+            llm_status = "cached"
+    elif llm is not None:
+        from .llm import apply
+        res = llm.link(page, img, work_dir / "llm")
+        if res is None:
+            llm_status = "failed"
+        else:
+            apply(page, res)
+            llm_status = "cached" if res.cached else "called"
     page.save(json_path)
     if debug:
         out = debug_path(work_dir, page_id)
         out.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(out), render_debug(page, img), [cv2.IMWRITE_JPEG_QUALITY, 85])
-    return Result(page_id, skipped=False, page=page)
+    return Result(page_id, skipped=False, page=page, llm=llm_status)
