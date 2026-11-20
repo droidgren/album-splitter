@@ -167,6 +167,45 @@ def cmd_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_export(args: argparse.Namespace) -> int:
+    from .exiftool import ExiftoolError, find_exiftool, version
+    from .export import export_work_dir
+
+    work_dir = Path(args.work_dir).resolve()
+    out_dir = Path(args.out).resolve()
+    if not (work_dir / "pages").is_dir():
+        print(f"No pages in {work_dir}; run detect first", file=sys.stderr)
+        return 1
+    input_dir = Path(args.input).resolve() if args.input else load_input_dir(work_dir)
+    if input_dir is None or not input_dir.is_dir():
+        print(f"Scan folder {input_dir} not found; pass --input", file=sys.stderr)
+        return 1
+    try:
+        out_dir.relative_to(input_dir)
+        print("The export folder may not be inside the scan folder", file=sys.stderr)
+        return 1
+    except ValueError:
+        pass
+    tool = None
+    if args.metadata:
+        tool = find_exiftool(args.exiftool)
+        try:
+            if tool is None:
+                raise ExiftoolError("not found")
+            ver = version(tool)
+        except (ExiftoolError, OSError) as e:
+            print(f"exiftool: {e}. Install it, set ALBUMSPLIT_EXIFTOOL or pass --exiftool PATH "
+                  f"(or --no-metadata to export without captions in the files).", file=sys.stderr)
+            return 1
+        print(f"exiftool {ver}: {' '.join(tool)}")
+    rep = export_work_dir(work_dir, out_dir, input_dir, include_proposed=args.all, only=args.only,
+                          cards=args.cards, quality=args.quality, exiftool=tool, progress=print)
+    note = f", {rep.skipped} pages not approved (--all exports them)" if rep.skipped else ""
+    fails = f", {len(rep.failed)} failed" if rep.failed else ""
+    print(f"Exported {rep.photos} photos from {rep.pages} pages to {out_dir}{note}{fails}")
+    return 1 if rep.failed or not rep.photos else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="albumsplit")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -206,6 +245,21 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--open", action=argparse.BooleanOptionalAction, default=None,
                    help="open a browser (default: on unless --host 0.0.0.0)")
     r.set_defaults(func=cmd_review)
+
+    e = sub.add_parser("export", help="write photo crops, caption cards and index.csv")
+    e.add_argument("work_dir")
+    e.add_argument("--out", required=True, help="export directory")
+    e.add_argument("--input", help="scan directory (default: the one detect used)")
+    e.add_argument("--all", action="store_true", help="also export pages not yet approved")
+    e.add_argument("--only", help="only export pages whose id matches this glob")
+    e.add_argument("--cards", action=argparse.BooleanOptionalAction, default=True,
+                   help="also write <page>_<n>_card.jpg with the handwritten caption (default: on)")
+    e.add_argument("--quality", type=int, default=95, help="JPEG quality (default: 95)")
+    e.add_argument("--metadata", action=argparse.BooleanOptionalAction, default=True,
+                   help="write caption and date into the files with exiftool (default: on)")
+    e.add_argument("--exiftool", help=f"exiftool program or folder (default: $ALBUMSPLIT_EXIFTOOL, "
+                                      f"PATH, or .venv/exiftool-*)")
+    e.set_defaults(func=cmd_export)
 
     args = ap.parse_args(argv)
     return args.func(args)

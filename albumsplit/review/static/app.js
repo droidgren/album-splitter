@@ -8,6 +8,7 @@ const PALETTE = ["#e62828", "#1478e6", "#1eb41e", "#ffa000", "#c828c8", "#00c8c8
 const GREY = "#969696";
 const HANDLE = 7;      // handle half-size, canvas px
 const DRAG_MIN = 5;    // px before a press becomes a drag
+const GRAB_MIN = 12;   // px before a press on an item that isn't selected moves it (a click may wobble)
 const SAVE_DELAY = 300;
 const DATE_RE = String.raw`\d{4}(-\d{2}(-\d{2})?)?`;  // what export can write as DateTimeOriginal
 
@@ -289,6 +290,7 @@ function draw() {
       const [sx0, sy0] = bbox(p.stamp.corners);
       label(`${p.stamp.text || "?"} = ${p.stamp.date || "?"}`, sx0, sy0 - 4 * px, c, 12 * px, "bottom");
     }
+    if (p.rotation || sel) upMarker(p, c, px);
     const [cx, cy] = centroid(p.outline || p.corners);
     ctx.beginPath(); ctx.arc(cx, cy, 18 * px, 0, 2 * Math.PI); ctx.fillStyle = c; ctx.fill();
     ctx.fillStyle = "#fff"; ctx.font = `bold ${18 * px}px system-ui`; ctx.textAlign = "center"; ctx.textBaseline = "middle";
@@ -318,6 +320,21 @@ function draw() {
     const [x0, y0, x1, y1] = [Math.min(d.x0, d.x), Math.min(d.y0, d.y), Math.max(d.x0, d.x), Math.max(d.y0, d.y)];
     poly([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], { stroke: d.photo ? "#000" : "#555", width: 2 * px, dash: [6 * px, 4 * px] });
   }
+}
+
+// Which edge of the print is up in the export: a triangle pointing at it, just inside the frame.
+// rotation turns the crop clockwise, so 90 puts the left edge on top, 180 the bottom, 270 the right.
+const TOP_EDGE = { 0: [0, 1], 90: [3, 0], 180: [2, 3], 270: [1, 2] };
+function upMarker(p, color, px) {
+  const [i, j] = TOP_EDGE[p.rotation || 0], a = p.corners[i], b = p.corners[j];
+  const [cx, cy] = centroid(p.corners);
+  const mx = (a[0] + b[0]) / 2, my = (a[1] + b[1]) / 2;
+  const dx = mx - cx, dy = my - cy, len = Math.hypot(dx, dy) || 1;
+  const ux = dx / len, uy = dy / len, s = 16 * px;          // unit vector towards the top edge
+  const tx = mx - ux * 2 * s, ty = my - uy * 2 * s;          // tip, a little inside the edge
+  poly([[tx, ty], [tx - ux * 1.6 * s - uy * s, ty - uy * 1.6 * s + ux * s],
+        [tx - ux * 1.6 * s + uy * s, ty - uy * 1.6 * s - ux * s]],
+       { fill: color, stroke: "#fff", width: 1.5 * px, alpha: 0.9 });
 }
 
 function poly(pts, { stroke, fill, width = 1, dash = null, alpha = 1 }) {
@@ -372,7 +389,7 @@ canvas.addEventListener("pointermove", (e) => {
   if (d.mode === "pan") {
     S.view.tx = d.tx + sx - d.sx; S.view.ty = d.ty + sy - d.sy; draw(); return;
   }
-  if (!d.active && Math.hypot(sx - d.sx, sy - d.sy) < DRAG_MIN * dpr) return;
+  if (!d.active && Math.hypot(sx - d.sx, sy - d.sy) < (d.grab ? GRAB_MIN : DRAG_MIN) * dpr) return;
   if (!d.active && d.grab) { S.sel = d.grab; renderPanel(); }
   d.active = true;
   const [x, y] = toPage(sx, sy);
@@ -467,7 +484,7 @@ function createBox(d) {
     if (d.photo) {
       const id = Math.max(0, ...S.page.photos.map((p) => p.id)) + 1;
       S.page.photos.push({ id, corners: [[r1(x0), r1(y0)], [r1(x1), r1(y0)], [r1(x1), r1(y1)], [r1(x0), r1(y1)]],
-                           needs_review: false, outline: null, stamp: null, caption: null, date: null });
+                           needs_review: false, outline: null, stamp: null, caption: null, date: null, rotation: 0 });
       S.sel = { kind: "photo", id };
     } else {
       const id = Math.max(0, ...S.page.texts.map((t) => t.id)) + 1;
@@ -477,6 +494,15 @@ function createBox(d) {
     }
   });
   select(S.sel);
+}
+
+function rotateSelected(step) {
+  if (S.busy) { hint("Wait for Claude's answer…"); return; }
+  if (!S.sel || S.sel.kind !== "photo") { hint("Select a photo to rotate (R turns it clockwise, Shift+R back)."); return; }
+  const id = S.sel.id;
+  mutate(() => { const p = photoById(id); p.rotation = (((p.rotation || 0) + step) % 360 + 360) % 360; });
+  const r = photoById(id).rotation;
+  hint(`Photo ${id}: ${r ? `turned ${r}° clockwise` : "upright as on the page"} in the export (the triangle marks its top)`);
 }
 
 function deleteSelected() {
@@ -539,6 +565,8 @@ document.addEventListener("keydown", (e) => {
     case "n": case "N": { const j = nextUnreviewed(); if (j >= 0) go(j); else hint("All pages approved."); break; }
     case "u": case "U": setStatus("proposed"); break;
     case "l": case "L": askPage(); break;
+    case "r": rotateSelected(90); break;
+    case "R": rotateSelected(-90); break;
     case "Delete": case "Backspace": deleteSelected(); break;
     case "Escape": select(null); break;
     case "0": fit(); draw(); break;
@@ -613,11 +641,16 @@ function setBusy(label) {
   document.querySelectorAll("button.ask").forEach((b) => { b.disabled = !!label; });
 }
 
+// "claude-sonnet-5-5" -> "Claude Sonnet 5.5"
+const modelName = (id) => !id ? "Claude" : id.replace(/^claude-/, "Claude ")
+  .replace(/-(\d+)-(\d+)$/, " $1.$2").replace(/-(\d+)$/, " $1")
+  .replace(/ (\w)/, (m, c) => " " + c.toUpperCase());
+
 function askPage() {
   const pid = encodeURIComponent(S.page.page_id);
   withClaude("Claude is reading the captions…", `/api/pages/${pid}/llm`, (pg) => {
     const r = pg.llm_result;
-    return `Claude: ${r.transcribed} caption${r.transcribed === 1 ? "" : "s"} read`
+    return `${modelName(r.model)}: ${r.transcribed} caption${r.transcribed === 1 ? "" : "s"} read`
       + (r.issues ? `, ${r.issues} issue${r.issues === 1 ? "" : "s"} reported` : "") + " (Ctrl+Z undoes)";
   });
 }
@@ -626,8 +659,8 @@ function askStamp(photoId) {
   const pid = encodeURIComponent(S.page.page_id);
   withClaude(`Claude is reading the date stamp of photo ${photoId}…`, `/api/pages/${pid}/photos/${photoId}/stamp`, (pg) => {
     const r = pg.stamp_result;
-    if (!r.found) return `Claude sees no date stamp on photo ${photoId}.`;
-    return `Photo ${photoId}: stamp "${r.text}" = ${r.date || "date unclear"}`;
+    if (!r.found) return `${modelName(r.model)} sees no date stamp on photo ${photoId}.`;
+    return `Photo ${photoId}: stamp "${r.text}" = ${r.date || "date unclear"} (${modelName(r.model)})`;
   });
 }
 
@@ -688,6 +721,9 @@ function renderPanel() {
       el("div", { class: "head", onclick: () => select({ kind: "photo", id: p.id }) },
         el("b", {}, `Photo ${p.id}`),
         p.needs_review ? el("span", { class: "review", title: "Detection is unsure about this frame" }, "check frame") : null,
+        el("button", { class: "rotate", title: "Turn the exported photo 90° clockwise (R, Shift+R back)",
+          onclick: (e) => { e.stopPropagation(); select({ kind: "photo", id: p.id }); rotateSelected(90); } },
+          p.rotation ? `↻ ${p.rotation}°` : "↻"),
         el("span", { class: "muted" }, tids.length ? tids.join(", ") : "no text")),
       el("label", {}, "Caption"),
       overrideField({ key: `cap${p.id}`, multiline: true, value: p.caption, derived: p.derived_caption,

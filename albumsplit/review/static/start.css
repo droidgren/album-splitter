@@ -36,11 +36,11 @@ button.primary { background: #2e7d32; border-color: #2e7d32; color: #fff; }
 .stat.ok b { color: #2e7d32; }
 
 .bar { height: 10px; background: #e3e3e3; border-radius: 5px; overflow: hidden; margin-top: 10px; }
-#bar-fill { height: 100%; width: 0; background: #2e7d32; transition: width .3s; }
-#progress-text { margin-top: 4px; color: #555; }
-#log { max-height: 180px; overflow: auto; background: #222; color: #ddd; padding: 6px 8px; border-radius: 4px;
+#bar-fill, #export-fill { height: 100%; width: 0; background: #2e7d32; transition: width .3s; }
+#progress-text, #export-text { margin-top: 4px; color: #555; }
+#log, #export-log { max-height: 180px; overflow: auto; background: #222; color: #ddd; padding: 6px 8px; border-radius: 4px;
        font-size: 12px; margin: 6px 0 0; white-space: pre-wrap; }
-#log:empty { display: none; }
+#log:empty, #export-log:empty { display: none; }
 
 dialog { width: min(640px, 92vw); border: 1px solid #999; border-radius: 6px; padding: 14px 18px; }
 dialog::backdrop { background: rgba(0,0,0,.35); }
@@ -50,3 +50,12 @@ dialog::backdrop { background: rgba(0,0,0,.35); }
 #dirs li::before { content: "📁 "; }
 #dirs li.empty { color: #888; cursor: default; }
 #dirs li.empty::before { content: ""; }
+
+select { font: inherit; padding: 4px 6px; border: 1px solid #bbb; border-radius: 4px; }
+.sub { margin-left: 26px; }
+.sub label.check { margin-top: 2px; }
+.sub.off { opacity: .45; pointer-events: none; }
+h4 { margin: 14px 0 4px; font-size: 14px; }
+.batch { padding: 6px 10px; margin-top: 4px; background: #f7f3ee; border-left: 4px solid #8d6e63; border-radius: 3px; }
+.batch .bar { height: 6px; margin-top: 4px; }
+.batch .bar div { height: 100%; background: #8d6e63; }

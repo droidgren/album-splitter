@@ -2,7 +2,7 @@
 // Start page: choose the scan and work folders, run detection, go to review.
 
 const $ = (id) => document.getElementById(id);
-let pollTimer = null;
+let pollTimer = null, exportTimer = null;
 let stats = null;  // last project stats, for the re-detect-all warning
 
 async function api(path, opts) {
@@ -27,6 +27,7 @@ async function init() {
   else if (recent.length) { $("work-dir").value = recent[0].work_dir; $("input-dir").value = recent[0].input_dir; }
   renderProject(proj);
   if (proj.detect && proj.detect.state !== "finished") poll();
+  if (proj.export) pollExport();
 }
 
 function renderRecent(items, proj) {
@@ -52,6 +53,7 @@ async function openProject() {
     $("input-dir").value = proj.input_dir;
     $("work-dir").value = proj.work_dir;
     msg("open-msg", "");
+    $("export-dir").value = "";  // the new project's own export folder
     renderProject(proj);
     renderRecent(await api("/api/recent"), proj);
   } catch (e) { msg("open-msg", e.message, true); }
@@ -67,12 +69,49 @@ function renderProject(proj) {
     + stat(s.new, "not detected yet", s.new ? "warn" : "") + stat(s.approved, "approved", s.approved ? "ok" : "")
     + stat(s.edited, "edited, not approved") + stat(s.needs_review, "flagged for a check", s.needs_review ? "warn" : "");
   if (s.scan_error) msg("detect-msg", s.scan_error, true);
-  $("llm-note").textContent = proj.api_key ? `(${proj.llm_model}, costs a few cents per page)`
+  renderModels(proj);
+  $("llm-note").textContent = proj.api_key ? ""
     : "(needs ANTHROPIC_API_KEY set before starting albumsplit, or an `ant auth login`)";
+  $("llm-mode").classList.toggle("off", !$("opt-llm").checked);
+  if (proj.pending && proj.pending.batches) { $("batches-box").hidden = false; schedulePollBatches(1000); }
   updateDetectButton(s);
   $("review").disabled = !s.pages;
   const left = s.pages - s.approved;
   msg("review-msg", s.pages ? `${left} of ${s.pages} pages left to approve` : "Detect the pages first.");
+  if (!$("export-dir").value) $("export-dir").value = proj.export_dir || "";
+  const ex = proj.exiftool || {};
+  $("exif-note").textContent = ex.found ? `(exiftool ${ex.version})`
+    : "(exiftool not found: install it or set ALBUMSPLIT_EXIFTOOL, then restart albumsplit)";
+  if (!ex.found) $("opt-meta").checked = false;
+  $("opt-meta").disabled = !ex.found;
+  updateExportButton(s);
+}
+
+function renderModels(proj) {
+  const sel = $("llm-model");
+  if (sel.options.length !== proj.llm_models.length) {
+    sel.innerHTML = "";
+    for (const m of proj.llm_models) sel.add(new Option(m.label, m.id));
+  }
+  sel.value = proj.llm_model;
+  const cur = proj.llm_models.find((m) => m.id === proj.llm_model);
+  $("model-note").textContent = cur && cur.note ? cur.note + " per million tokens in / out" : "";
+}
+
+async function setModel() {
+  try {
+    renderProject(await post("/api/settings", { llm_model: $("llm-model").value }));
+  } catch (e) { msg("detect-msg", e.message, true); }
+}
+
+const llmMode = () => document.querySelector('input[name="llm-mode"]:checked').value;
+
+function updateExportButton(s) {
+  const n = $("opt-all").checked ? s.pages : s.approved;
+  $("export").textContent = n ? `Export ${n} page${n === 1 ? "" : "s"}` : "Export";
+  if (!(exportRunning)) $("export").disabled = !n;
+  if (!n && !exportRunning) msg("export-msg", s.pages ? "Approve pages in review first, or tick the box above." : "");
+  else if (!exportRunning) msg("export-msg", "");
 }
 
 function updateDetectButton(s) {
@@ -87,7 +126,8 @@ function updateDetectButton(s) {
 async function startDetect(force = false) {
   msg("detect-msg", "");
   try {
-    const proj = await post("/api/detect", { llm: $("opt-llm").checked, redo: $("opt-redo").checked, force });
+    const proj = await post("/api/detect", { llm: $("opt-llm").checked, batch: llmMode() === "batch",
+      redo: $("opt-redo").checked, force });
     renderProject(proj);
     poll();
   } catch (e) { msg("detect-msg", e.message, true); }
@@ -99,7 +139,8 @@ function redetectAll() {
   const lines = [`Detect all ${s.scans ?? ""} scans again from scratch?`];
   if (reviewed) lines.push("", `${reviewed} page${reviewed === 1 ? "" : "s"} you approved or edited `
     + "will lose your changes (frames, links, captions, dates) and go back to unreviewed.");
-  if ($("opt-llm").checked) lines.push("", "Claude reads every page again: this costs a few cents per page.");
+  if ($("opt-llm").checked) lines.push("", `Claude (${$("llm-model").selectedOptions[0].text}) reads every page again`
+    + (llmMode() === "batch" ? " as a batch, at half price." : ", at full price."));
   if (confirm(lines.join("\n"))) startDetect(true);
 }
 
@@ -116,7 +157,8 @@ async function poll() {
   $("bar-fill").style.width = st.total ? `${(100 * st.done) / st.total}%` : "0";
   const eta = st.done && running ? Math.round((st.elapsed / st.done) * (st.total - st.done)) : 0;
   $("progress-text").textContent = `${st.done} / ${st.total}: ${st.detected} detected, ${st.skipped} skipped`
-    + (st.failed ? `, ${st.failed} failed` : "") + (st.current && running ? ` · ${st.current}` : "")
+    + (st.failed ? `, ${st.failed} failed` : "") + (st.queued ? `, ${st.queued} queued for Claude` : "")
+    + (st.current && running ? ` · ${st.current}` : "")
     + (eta ? ` · about ${fmtTime(eta)} left` : "") + (running ? "" : ` · ${st.state}`)
     + (st.error ? ` · ${st.error}` : "");
   const log = $("log");
@@ -127,6 +169,113 @@ async function poll() {
   else renderProject(await api("/api/project"));
 }
 
+// ---------- Claude batches ----------
+
+let batchTimer = null, collecting = false;
+const BATCH_POLL_MS = 60000;
+
+function schedulePollBatches(ms) {
+  clearTimeout(batchTimer);
+  batchTimer = setTimeout(pollBatches, ms);
+}
+
+async function pollBatches() {
+  clearTimeout(batchTimer);
+  let list;
+  try { list = await api("/api/batches"); }
+  catch (e) { msg("batch-msg", e.message, true); schedulePollBatches(BATCH_POLL_MS); return; }
+  renderBatches(list);
+  if (!list.length) return;
+  if (list.some((b) => b.status === "ended")) await collectBatches();
+  else schedulePollBatches(BATCH_POLL_MS);
+}
+
+function renderBatches(list) {
+  $("batches-box").hidden = !list.length && !$("batch-msg").textContent;
+  const box = $("batches");
+  box.innerHTML = "";
+  for (const b of list) {
+    const div = document.createElement("div");
+    div.className = "batch";
+    const done = (b.succeeded || 0) + (b.errored || 0) + (b.canceled || 0) + (b.expired || 0);
+    const age = b.submitted ? ` · sent ${fmtTime(Math.round(Date.now() / 1000 - b.submitted))} ago` : "";
+    const state = b.status === "ended" ? "done, applying the answers…"
+      : b.status === "in_progress" ? `${done} of ${b.pages} read` : b.status;
+    const opt = [...$("llm-model").options].find((o) => o.value === b.model);
+    div.textContent = `${b.pages} page${b.pages === 1 ? "" : "s"} · ${opt ? opt.text : b.model} · ${state}${age}`
+      + (b.errored ? ` · ${b.errored} failed` : "") + (b.error ? ` · ${b.error}` : "");
+    const bar = document.createElement("div");
+    bar.className = "bar";
+    bar.innerHTML = `<div style="width:${b.pages ? (100 * done) / b.pages : 0}%"></div>`;
+    div.append(bar);
+    box.append(div);
+  }
+}
+
+async function collectBatches() {
+  if (collecting) return;
+  collecting = true;
+  try {
+    const r = await post("/api/batches/collect");
+    const parts = [`Claude's answers applied to ${r.updated} page${r.updated === 1 ? "" : "s"}`];
+    if (r.not_updated) parts.push(`${r.not_updated} left as they were (see the log)`);
+    msg("batch-msg", parts.join("; ") + ".");
+    if (r.log.length) {
+      const log = $("log");
+      $("progress").hidden = false;
+      log.textContent += (log.textContent ? "\n" : "") + r.log.join("\n");
+      log.scrollTop = log.scrollHeight;
+    }
+    renderProject(r.project);
+    if (r.pending.batches) schedulePollBatches(BATCH_POLL_MS);
+    else renderBatches([]);
+  } catch (e) {
+    msg("batch-msg", e.message, true);
+    schedulePollBatches(BATCH_POLL_MS);
+  } finally { collecting = false; }
+}
+
+// ---------- export ----------
+
+let exportRunning = false;
+
+async function startExport() {
+  msg("export-msg", "");
+  try {
+    const proj = await post("/api/export", { out_dir: $("export-dir").value, all: $("opt-all").checked,
+      cards: $("opt-cards").checked, metadata: $("opt-meta").checked });
+    $("export-dir").value = proj.export_dir;
+    pollExport();
+  } catch (e) { msg("export-msg", e.message, true); }
+}
+
+async function pollExport() {
+  clearTimeout(exportTimer);
+  let st;
+  try { st = await api("/api/export"); } catch (e) { msg("export-msg", e.message, true); return; }
+  if (!st) return;
+  exportRunning = st.state === "starting" || st.state === "running";
+  $("export-progress").hidden = false;
+  $("export").disabled = exportRunning;
+  $("export-cancel").hidden = !exportRunning;
+  $("export-fill").style.width = st.total ? `${(100 * st.done) / st.total}%` : "0";
+  const eta = st.done && exportRunning ? Math.round((st.elapsed / st.done) * (st.total - st.done)) : 0;
+  $("export-text").textContent = `${st.done} / ${st.total} pages` + (st.photos ? `, ${st.photos} photos` : "")
+    + (st.failed ? `, ${st.failed} failed` : "") + (st.current && exportRunning ? ` · ${st.current}` : "")
+    + (eta ? ` · about ${fmtTime(eta)} left` : "") + (exportRunning ? "" : ` · ${st.state}`)
+    + (st.error ? ` · ${st.error}` : "");
+  const log = $("export-log");
+  const atEnd = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+  log.textContent = st.log.join("\n");
+  if (atEnd) log.scrollTop = log.scrollHeight;
+  if (exportRunning) exportTimer = setTimeout(pollExport, 1000);
+  else {
+    if (st.state === "finished") msg("export-msg", `Saved in ${st.out_dir}`);
+    const proj = await api("/api/project");
+    if (proj.stats) updateExportButton(proj.stats);
+  }
+}
+
 function fmtTime(s) { return s < 90 ? `${s} s` : s < 5400 ? `${Math.round(s / 60)} min` : `${(s / 3600).toFixed(1)} h`; }
 
 // ---------- folder browser ----------
@@ -135,7 +284,8 @@ let browseTarget = null, browsing = null;
 
 async function browse(target) {
   browseTarget = target;
-  $("browser-title").textContent = target === "input-dir" ? "Choose the scan folder" : "Choose the work folder";
+  $("browser-title").textContent = { "input-dir": "Choose the scan folder", "work-dir": "Choose the work folder",
+    "export-dir": "Choose the export folder" }[target];
   let start = $(target).value.trim();
   if (!start && target === "work-dir" && $("input-dir").value) start = $("input-dir").value;
   $("browser").showModal();
@@ -189,6 +339,13 @@ $("detect").addEventListener("click", () => startDetect(false));
 $("redetect-all").addEventListener("click", redetectAll);
 $("cancel").addEventListener("click", () => post("/api/detect/cancel").then(poll));
 $("opt-redo").addEventListener("change", () => api("/api/project").then((p) => p.stats && updateDetectButton(p.stats)));
+$("opt-llm").addEventListener("change", () => $("llm-mode").classList.toggle("off", !$("opt-llm").checked));
+$("llm-model").addEventListener("change", setModel);
+$("batch-check").addEventListener("click", () => { msg("batch-msg", "Checking…"); pollBatches().then(() => {
+  if ($("batch-msg").textContent === "Checking…") msg("batch-msg", ""); }); });
 $("review").addEventListener("click", () => { location.href = "/review"; });
+$("export").addEventListener("click", startExport);
+$("export-cancel").addEventListener("click", () => post("/api/export/cancel").then(pollExport));
+$("opt-all").addEventListener("change", () => api("/api/project").then((p) => p.stats && updateExportButton(p.stats)));
 
 init().catch((e) => msg("open-msg", "Failed to load: " + e.message, true));

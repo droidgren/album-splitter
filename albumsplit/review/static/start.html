@@ -30,21 +30,52 @@
     <h2>Project</h2>
     <div id="stats" class="stats"></div>
 
+    <label for="llm-model">Claude model <small>(for detection, <b>L</b> / Ask Claude and stamp reading in review)</small></label>
+    <div class="row"><select id="llm-model"></select><span id="model-note" class="muted"></span></div>
+
     <h3>1. Detect</h3>
     <p class="muted">Finds the photos, captions and camera date stamps on scans that have no page file yet.
       Pages you have edited or approved are kept, except with <b>Re-detect all</b>, which starts every page over.</p>
     <label class="check"><input id="opt-llm" type="checkbox"> Read and link the captions with Claude
       <small id="llm-note"></small></label>
-    <label class="check"><input id="opt-redo" type="checkbox"> Also re-detect pages that are not yet reviewed</label>
+    <div id="llm-mode" class="sub">
+      <label class="check"><input type="radio" name="llm-mode" value="batch" checked>
+        <b>Batch</b>: half price, answers arrive later <small>(usually within an hour, at most 24 h; you can
+        start reviewing meanwhile)</small></label>
+      <label class="check"><input type="radio" name="llm-mode" value="now">
+        <b>Now</b>: full price, each page is read during detection</label>
+    </div>
+    <label class="check"><input id="opt-redo" type="checkbox"> Also redo pages I haven't changed or approved yet</label>
     <div class="row"><button id="detect" class="primary">Detect</button><button id="cancel" hidden>Cancel</button>
       <button id="redetect-all" class="danger" title="Detect every scan again, including pages you have edited or approved">Re-detect all…</button>
       <span id="detect-msg" class="msg"></span></div>
     <div id="progress" hidden><div class="bar"><div id="bar-fill"></div></div><div id="progress-text"></div>
       <pre id="log"></pre></div>
+    <div id="batches-box" hidden>
+      <h4>Waiting for Claude <small class="muted">(checked every minute; answers are applied as soon as a batch is done)</small></h4>
+      <div id="batches"></div>
+      <div class="row"><button id="batch-check">Check now</button><span id="batch-msg" class="msg"></span></div>
+    </div>
 
     <h3>2. Review</h3>
     <div class="row"><button id="review" class="primary">Start review →</button>
       <span id="review-msg" class="msg"></span></div>
+
+    <h3>3. Export</h3>
+    <p class="muted">Writes each photo as a straightened full-size JPG, a card with the handwritten caption
+      underneath, and <code>index.csv</code>. Exporting again overwrites the files of the same pages.</p>
+    <label for="export-dir">Export folder</label>
+    <div class="row"><input id="export-dir" type="text" placeholder="Folder for the exported photos">
+      <button data-browse="export-dir">Browse…</button></div>
+    <label class="check"><input id="opt-all" type="checkbox"> Also export pages that are not approved yet</label>
+    <label class="check"><input id="opt-cards" type="checkbox" checked> Caption cards
+      <small>(<code>&lt;page&gt;_&lt;n&gt;_card.jpg</code>: the photo with its handwritten caption)</small></label>
+    <label class="check"><input id="opt-meta" type="checkbox" checked> Write caption and date into the photo files
+      <small id="exif-note"></small></label>
+    <div class="row"><button id="export" class="primary">Export</button><button id="export-cancel" hidden>Cancel</button>
+      <span id="export-msg" class="msg"></span></div>
+    <div id="export-progress" hidden><div class="bar"><div id="export-fill"></div></div><div id="export-text"></div>
+      <pre id="export-log"></pre></div>
   </section>
 </main>
 

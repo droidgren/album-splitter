@@ -39,7 +39,8 @@ def env(tmp_path: Path):
                                  date="1984-04-22")],
                 links=[Link(1, 1), Link(2, 2)])
     page.save(page_json_path(work, "p1"))
-    return TestClient(create_app(work, scans)), work, scans
+    # Own config dir: opening a project must not add test folders to the user's recent list.
+    return TestClient(create_app(work, scans, config_dir=tmp_path / "cfg")), work, scans
 
 
 def test_list_and_get(env):
@@ -313,3 +314,229 @@ def test_redetect_all_overwrites_reviewed_pages(tmp_path: Path):
     assert st["detected"] == 1, st
     page = Page.load(path)
     assert page.status == "proposed" and not page.edited and page.photos
+
+
+# ---------- rotation and export ----------
+
+def test_rotation_roundtrip_and_snapped(env):
+    client, work, _ = env
+    d = client.get("/api/pages/p1").json()
+    assert d["photos"][0]["rotation"] == 0
+    d["photos"][0]["rotation"] = 270
+    d["photos"][1]["rotation"] = 100  # not a quarter turn: snapped to 90
+    client.put("/api/pages/p1", json=d)
+    page = Page.load(page_json_path(work, "p1"))
+    assert [p.rotation for p in page.photos] == [270, 90]
+
+
+def _wait_export(client):
+    import time
+    for _ in range(300):
+        st = client.get("/api/export").json()
+        if st["state"] not in ("starting", "running"):
+            return st
+        time.sleep(0.1)
+    raise AssertionError(st)
+
+
+def test_export_job_from_start_page(env, tmp_path):
+    client, work, scans = env
+    proj = client.get("/api/project").json()
+    assert proj["export_dir"] == str(work / "export") and "found" in proj["exiftool"]
+    # Not inside the scans.
+    r = client.post("/api/export", json={"out_dir": str(scans / "out"), "metadata": False})
+    assert r.status_code == 422
+    out = tmp_path / "ut"
+    # Nothing approved yet: runs, exports nothing.
+    assert client.post("/api/export", json={"out_dir": str(out), "metadata": False}).status_code == 200
+    st = _wait_export(client)
+    assert st["state"] == "finished" and st["total"] == 0 and st["photos"] == 0
+    # With the not-approved pages, and a rotated photo.
+    d = client.get("/api/pages/p1").json()
+    d["photos"][1]["rotation"] = 90
+    client.put("/api/pages/p1", json=d)
+    client.post("/api/export", json={"out_dir": str(out), "all": True, "cards": False, "metadata": False})
+    st = _wait_export(client)
+    assert st["state"] == "finished" and st["done"] == 1 and st["photos"] == 2, st
+    assert sorted(p.name for p in out.iterdir()) == ["index.csv", "p1_1.jpg", "p1_2.jpg"]
+    h, w = cv2.imread(str(out / "p1_2.jpg")).shape[:2]
+    assert h > w  # 1600x1200 print turned a quarter
+    # The folder is remembered in workdir.json, without losing what else is there.
+    assert client.get("/api/project").json()["export_dir"] == str(out.resolve())
+    from albumsplit.pipeline import load_input_dir, save_input_dir
+    save_input_dir(work, scans)
+    assert client.get("/api/project").json()["export_dir"] == str(out.resolve())
+    assert load_input_dir(work) == scans
+
+
+def test_export_needs_exiftool_when_metadata_wanted(env, tmp_path, monkeypatch):
+    import albumsplit.exiftool as et
+    monkeypatch.setattr(et, "find_exiftool", lambda explicit=None: None)
+    client, _, _ = env
+    r = client.post("/api/export", json={"out_dir": str(tmp_path / "ut"), "all": True})
+    assert r.status_code == 422 and "exiftool" in r.json()["detail"]
+
+
+# ---------- model setting and Claude batches, with a fake Batch API ----------
+
+def _run_detect(client, body):
+    import time
+    assert client.post("/api/detect", json=body).status_code == 200
+    for _ in range(300):
+        st = client.get("/api/detect").json()
+        if st["state"] not in ("starting", "running"):
+            return st
+        time.sleep(0.1)
+    raise AssertionError("detection did not finish")
+
+
+def _two_scan_project(tmp_path: Path):
+    scans, work = tmp_path / "scans", tmp_path / "work"
+    scans.mkdir()
+    for i, name in enumerate(("a", "b")):  # different scans: identical requests are sent once
+        img = np.full((900, 1200, 3), 245, np.uint8)
+        cv2.rectangle(img, (100 + 300 * i, 100), (600 + 300 * i, 500), (60, 90, 120), -1)
+        cv2.imwrite(str(scans / f"{name}.jpg"), img)
+    client = TestClient(create_app(config_dir=tmp_path / "cfg"))
+    client.post("/api/project", json={"work_dir": str(work), "input_dir": str(scans)})
+    return client, work
+
+
+class FakeBatches:
+    created: list = []
+    status = "in_progress"
+
+    def create(self, requests):
+        from types import SimpleNamespace as NS
+        FakeBatches.created.append(requests)
+        return NS(id=f"batch{len(FakeBatches.created)}")
+
+    def retrieve(self, bid):
+        from types import SimpleNamespace as NS
+        n = len(FakeBatches.created[int(bid[5:]) - 1])
+        ended = FakeBatches.status == "ended"
+        return NS(processing_status=FakeBatches.status,
+                  request_counts=NS(processing=0 if ended else n, succeeded=n if ended else 0,
+                                    errored=0, canceled=0, expired=0))
+
+    def results(self, bid):
+        from types import SimpleNamespace as NS
+        answer = json.dumps({"texts": [], "issues": []})
+        for item in FakeBatches.created[int(bid[5:]) - 1]:
+            msg = NS(stop_reason="end_turn", content=[NS(type="text", text=answer)])
+            yield NS(custom_id=item["custom_id"], result=NS(type="succeeded", message=msg))
+
+
+def _fake_batch_linker():
+    from types import SimpleNamespace as NS
+
+    from albumsplit.llm import LlmLinker
+
+    class FakeBatchLinker(LlmLinker):
+        models: list = []
+
+        def __init__(self, model):  # no network: only the Batch API is used, and it is fake
+            self.model = model
+            self._anthropic = None
+            self.client = NS(messages=NS(batches=FakeBatches()))
+            FakeBatchLinker.models.append(model)
+    return FakeBatchLinker
+
+
+def test_model_setting_is_saved_per_project_and_used(tmp_path: Path, env, monkeypatch):
+    client, work, scans = env
+    client.post("/api/project", json={"work_dir": str(work), "input_dir": str(scans)})
+    info = client.get("/api/project").json()
+    assert info["llm_model"] == "claude-opus-5-5"
+    assert {m["id"] for m in info["llm_models"]} >= {"claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"}
+    r = client.post("/api/settings", json={"llm_model": "claude-sonnet-5-5"})
+    assert r.status_code == 200 and r.json()["llm_model"] == "claude-sonnet-5-5"
+    assert json.loads((work / "workdir.json").read_text(encoding="utf-8"))["llm_model"] == "claude-sonnet-5-5"
+    assert client.post("/api/settings", json={"llm_model": "gpt-4"}).status_code == 422
+    # Review's Ask Claude uses the chosen model.
+    monkeypatch.setattr("albumsplit.llm.LlmLinker", FakeLinker)
+    d = client.post("/api/pages/p1/llm").json()
+    assert d["llm_result"]["model"] == "claude-sonnet-5-5"
+
+
+def test_haiku_is_called_without_refusal_fallback():
+    from types import SimpleNamespace as NS
+
+    from albumsplit.llm import LlmLinker
+    sent = []
+
+    def create(**kw):
+        sent.append(kw)
+        return NS(stop_reason="end_turn", content=[NS(type="text", text='{"texts": [], "issues": []}')])
+    for model, has_fallback in (("claude-haiku-5-5", False), ("claude-opus-5-5", True)):
+        llm = LlmLinker.__new__(LlmLinker)
+        llm.model, llm._anthropic = model, NS(APIStatusError=OSError, APIConnectionError=OSError)
+        llm.client = NS(beta=NS(messages=NS(create=create)))
+        assert llm._call("p", [{"type": "text", "text": "x"}]) == {"texts": [], "issues": []}
+        assert ("fallbacks" in sent[-1]) == has_fallback and sent[-1]["model"] == model
+
+
+def test_batch_detect_then_collect(tmp_path: Path, monkeypatch):
+    FakeBatches.created, FakeBatches.status = [], "in_progress"
+    monkeypatch.setattr("albumsplit.llm.LlmLinker", _fake_batch_linker())
+    client, work = _two_scan_project(tmp_path)
+    client.post("/api/settings", json={"llm_model": "claude-sonnet-5-5"})
+
+    st = _run_detect(client, {"llm": True, "batch": True})
+    assert st["state"] == "finished" and st["detected"] == 2, st
+    assert st["queued"] == 2 and st["batches"] == ["batch1"]
+    assert len(FakeBatches.created[0]) == 2
+    assert FakeBatches.created[0][0]["params"]["model"] == "claude-sonnet-5-5"
+    assert client.get("/api/project").json()["pending"] == {"batches": 1, "pages": 2}
+    # Pages are saved right away with heuristic links, so review can start.
+    assert Page.load(work / "pages" / "a.json").linker == "heuristic"
+
+    b = client.get("/api/batches").json()
+    assert b[0]["status"] == "in_progress" and b[0]["pages"] == 2 and b[0]["processing"] == 2
+
+    # Page b is edited in review while the batch runs: its answer must not overwrite that.
+    pb = Page.load(work / "pages" / "b.json")
+    pb.edited = True
+    pb.save(work / "pages" / "b.json")
+
+    FakeBatches.status = "ended"
+    assert client.get("/api/batches").json()[0]["status"] == "ended"
+    r = client.post("/api/batches/collect").json()
+    assert r["updated"] == 1 and r["not_updated"] == 1, r
+    assert any("edited in review" in line for line in r["log"])
+    assert Page.load(work / "pages" / "a.json").linker == "llm:claude-sonnet-5-5"
+    assert Page.load(work / "pages" / "b.json").linker == "heuristic"
+    assert r["pending"] == {"batches": 0, "pages": 0}
+    assert client.get("/api/batches").json() == []
+
+
+def test_cancelled_batch_detect_still_submits_queued_pages(tmp_path: Path, monkeypatch):
+    FakeBatches.created, FakeBatches.status = [], "in_progress"
+    monkeypatch.setattr("albumsplit.llm.LlmLinker", _fake_batch_linker())
+    client, work = _two_scan_project(tmp_path)
+    import albumsplit.llm as llm_mod
+    from albumsplit.review.jobs import DetectJob
+    job = DetectJob(input_dir=tmp_path / "scans", work_dir=work, llm=llm_mod.LlmLinker("claude-opus-5-5"),
+                    batch=True)
+    orig = job._detect_all
+
+    def one_then_cancel(images, ids, queue):
+        orig(images[:1], ids, queue)
+        job.cancel()
+        orig(images[1:], ids, queue)
+    job._detect_all = one_then_cancel
+    job._run()
+    assert job.state == "cancelled" and job.queued == 1 and job.batches == ["batch1"]
+
+
+def test_edited_only_for_real_changes(env):
+    client, work, _ = env
+    d = client.get("/api/pages/p1").json()
+    assert client.put("/api/pages/p1", json=d).json()["edited"] is False  # nothing changed
+    d["status"] = "approved"
+    assert client.put("/api/pages/p1", json=d).json()["edited"] is False  # approving is not editing
+    d["status"] = "proposed"
+    assert client.put("/api/pages/p1", json=d).json()["edited"] is False  # nor is un-approving (U)
+    d["links"] = d["links"] + [{"text_id": 1, "photo_id": 2}]
+    assert client.put("/api/pages/p1", json=d).json()["edited"] is True   # a real change
+    assert Page.load(page_json_path(work, "p1")).edited

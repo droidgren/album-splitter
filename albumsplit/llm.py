@@ -26,6 +26,16 @@ from .imageio import downscale
 from .model import Issue, Link, Page, Photo, Point
 
 DEFAULT_MODEL = "claude-opus-5-5"
+# Models offered on the start page: (id, label, note). Prices per million input/output tokens.
+MODELS = [
+    ("claude-opus-5-5", "Claude Opus 5.5", "default: reads handwriting well ($4 / $20)"),
+    ("claude-sonnet-5-5", "Claude Sonnet 5.5", "half the price of Opus ($2 / $10)"),
+    ("claude-haiku-5-5", "Claude Haiku 5.5", "cheapest, may misread hard handwriting ($0.10 / $0.50)"),
+    ("claude-fable-5-2", "Claude Fable 5.2", "most capable, twice the price of Opus ($8 / $40)"),
+]
+# Models with a server-side refusal fallback (`fallbacks="default"`); Haiku has none.
+FALLBACK_MODELS = {"claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5",
+                   "claude-fable-5-2", "claude-fable-5-1"}
 ISSUE_KINDS = ("missed_caption", "missed_photo", "merged_photos", "bad_frame", "other")
 PROMPT_VERSION = 2  # bump when the prompt or schema changes, invalidates the cache
 PAGE_LONG_SIDE = 1568
@@ -319,13 +329,12 @@ class LlmLinker:
     def _call(self, page_id: str, content: list[dict], system: str = SYSTEM_PROMPT,
               schema: dict[str, Any] = SCHEMA) -> dict | None:
         a = self._anthropic
+        # Server-side refusal fallback, where the model has one; the Batch API does not accept
+        # it, so only here.
+        extra = ({"betas": ["server-side-fallback-2026-07-01"], "fallbacks": "default"}
+                 if self.model in FALLBACK_MODELS else {})
         try:
-            # Server-side refusal fallback; the Batch API does not accept it, so only here.
-            resp = self.client.beta.messages.create(
-                **self.params(content, system, schema),
-                betas=["server-side-fallback-2026-07-01"],
-                fallbacks="default",
-            )
+            resp = self.client.beta.messages.create(**self.params(content, system, schema), **extra)
         except (a.APIStatusError, a.APIConnectionError) as e:
             _warn(page_id, f"API error: {e}")
             return None
@@ -448,6 +457,12 @@ def _tag(canvas: np.ndarray, label: str, at: tuple[int, int], bg, fg, font: int,
 
 
 def text_crop(t, img_bgr: np.ndarray, photos=()) -> np.ndarray:
+    """Text block crop for Claude: `text_crop_full`, downscaled."""
+    small, _ = downscale(text_crop_full(t, img_bgr, photos), CROP_LONG_SIDE)
+    return small
+
+
+def text_crop_full(t, img_bgr: np.ndarray, photos=()) -> np.ndarray:
     """Full-resolution crop of a text block, white outside its paper outline and wherever
     a photo reaches into the margin around the box."""
     H, W = img_bgr.shape[:2]
@@ -469,20 +484,28 @@ def text_crop(t, img_bgr: np.ndarray, photos=()) -> np.ndarray:
             cv2.fillPoly(on_photo, [local(ph.outline or ph.corners)], 255)
         on_photo[y - y0:y - y0 + h, x - x0:x - x0 + w] = 0  # the box itself stays as detected
         crop[on_photo > 0] = 255
-    small, _ = downscale(crop, CROP_LONG_SIDE)
-    return small
+    return crop
 
 
-def warp_quad(img_bgr: np.ndarray, quad: list[Point]) -> np.ndarray:
-    """Perspective-corrected crop of a quad given as TL, TR, BR, BL."""
+def quad_size(quad: list[Point]) -> tuple[int, int]:
+    """Output (width, height) of `warp_quad` for a quad given as TL, TR, BR, BL."""
     q = np.array(quad, np.float32)
     w = int(round(max(np.linalg.norm(q[1] - q[0]), np.linalg.norm(q[2] - q[3]))))
     h = int(round(max(np.linalg.norm(q[3] - q[0]), np.linalg.norm(q[2] - q[1]))))
-    w, h = max(w, 1), max(h, 1)
+    return max(w, 1), max(h, 1)
+
+
+def quad_transform(quad: list[Point]) -> tuple[np.ndarray, tuple[int, int]]:
+    """Perspective matrix page -> `warp_quad` crop, and the crop's (width, height)."""
+    w, h = quad_size(quad)
     dst = np.array([(0, 0), (w - 1, 0), (w - 1, h - 1), (0, h - 1)], np.float32)
-    M = cv2.getPerspectiveTransform(q, dst)
-    return cv2.warpPerspective(img_bgr, M, (w, h), flags=cv2.INTER_AREA,
-                               borderMode=cv2.BORDER_REPLICATE)
+    return cv2.getPerspectiveTransform(np.array(quad, np.float32), dst), (w, h)
+
+
+def warp_quad(img_bgr: np.ndarray, quad: list[Point], flags: int = cv2.INTER_AREA) -> np.ndarray:
+    """Perspective-corrected crop of a quad given as TL, TR, BR, BL."""
+    M, (w, h) = quad_transform(quad)
+    return cv2.warpPerspective(img_bgr, M, (w, h), flags=flags, borderMode=cv2.BORDER_REPLICATE)
 
 
 def stamp_zoom(img_bgr: np.ndarray, corners: list[Point], grow_w: float = 1.6,

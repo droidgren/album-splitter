@@ -60,6 +60,13 @@ Implemented in `albumsplit/review/` (vanilla JS, no build step/CDN). Notes:
   (`static/start.html`): pick the scan and work folders with a server-side folder browser,
   run detection as a background job (`review/jobs.py`, optional Claude), then start review.
   Recent projects live in `~/.albumsplit/recent.json`. The work folder may not be inside the scans.
+- Claude model: chosen per project on the start page (`llm.MODELS`, saved as `llm_model` in
+  `workdir.json`; the CLI's `--llm-model` is the default). Used for detection, L and stamp reads.
+  Only models in `llm.FALLBACK_MODELS` get the server-side refusal fallback (Haiku has none).
+- Detect with Claude has two modes: **Batch** (default; Message Batches API, half price; pages are
+  saved with heuristic links at once, the start page polls `/api/batches` every minute and applies
+  answers when a batch ends) and **Now** (direct calls). Batch results never overwrite pages that
+  were approved or edited in review meanwhile; their answers stay in the `llm/` cache.
 - Scans are found via `<work_dir>/workdir.json` (written by detect); `--input` overrides it
   (Docker: `review /work --input /scans --host 0.0.0.0`). Previews are cached in `<work_dir>/preview/`.
 - **L** / "Ask Claude" re-runs the LLM linking+transcription on the current page as edited
@@ -87,6 +94,23 @@ Per photo:
   it would include parts of neighbouring photos. A caption wrapped around a print's corner
   has `texts[].outline` (its box minus the photo): blank out everything outside it.
 - One `index.csv` per run: file, source page, caption text, date.
+
+Implemented in `export.py` + `exiftool.py`. Notes:
+- Caption/date come from `model.effective_caption` / `effective_date`. Tags: EXIF ImageDescription,
+  XPTitle/XPComment (Windows Explorer), UserComment, XMP dc:description/dc:title, IPTC
+  Caption-Abstract (UTF-8); EXIF DateTimeOriginal/CreateDate (partial dates filled with 01) and
+  XMP photoshop:DateCreated / exif:DateTimeOriginal at the real precision. Everything goes through
+  a UTF-8 argfile, one exiftool run per page. `--no-metadata` skips it.
+- exiftool is found via `--exiftool`, `$ALBUMSPLIT_EXIFTOOL`, PATH, then `.venv/exiftool-*/`
+  (the Windows zip's `exiftool(-k).exe` waits for a key, so its bundled `perl.exe exiftool.pl`
+  is run instead). The Dockerfile installs `libimage-exiftool-perl`.
+- `photos[].rotation` (0/90/180/270 clockwise, default 0) turns the crop. Set in review with
+  **R** / **Shift+R** (or the ↻ button on the photo card); a triangle on the canvas marks the export's top edge.
+- The start page has an Export section (`review/jobs.ExportJob`, `POST /api/export`): export folder
+  (remembered as `export_dir` in `workdir.json`, default `<work_dir>/export`), approved-only or all,
+  cards and metadata switches. Detection and export never run at the same time.
+- Card caption strips keep page scale (shrunk only if wider than the photo) and have their paper
+  lifted to white (`export.whiten_paper`). Re-exporting a page deletes its stale `<page>_<n>` files.
 
 ## Conventions
 - Python 3.11+, English identifiers, type hints, small modules

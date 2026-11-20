@@ -44,18 +44,57 @@ def workdir_config_path(work_dir: Path) -> Path:
     return work_dir / "workdir.json"
 
 
-def save_input_dir(work_dir: Path, input_dir: Path) -> None:
-    """Remember where the scans are, so review and export can find the source images."""
+def _load_config(work_dir: Path) -> dict:
+    path = workdir_config_path(work_dir)
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _update_config(work_dir: Path, **values: str) -> None:
     path = workdir_config_path(work_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"input_dir": str(input_dir)}, indent=2), encoding="utf-8")
+    try:
+        cfg = _load_config(work_dir)
+    except (OSError, ValueError):
+        cfg = {}
+    cfg.update(values)
+    path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+
+def save_input_dir(work_dir: Path, input_dir: Path) -> None:
+    """Remember where the scans are, so review and export can find the source images."""
+    _update_config(work_dir, input_dir=str(input_dir))
 
 
 def load_input_dir(work_dir: Path) -> Path | None:
-    path = workdir_config_path(work_dir)
-    if not path.exists():
+    d = _load_config(work_dir).get("input_dir")
+    return Path(d) if d else None
+
+
+def save_export_dir(work_dir: Path, export_dir: Path) -> None:
+    """Remember the last export folder chosen on the start page."""
+    _update_config(work_dir, export_dir=str(export_dir))
+
+
+def save_llm_model(work_dir: Path, model: str) -> None:
+    """Remember the Claude model chosen on the start page for this project."""
+    _update_config(work_dir, llm_model=model)
+
+
+def load_llm_model(work_dir: Path) -> str | None:
+    try:
+        return _load_config(work_dir).get("llm_model") or None
+    except (OSError, ValueError):
         return None
-    return Path(json.loads(path.read_text(encoding="utf-8"))["input_dir"])
+
+
+def load_export_dir(work_dir: Path) -> Path | None:
+    try:
+        d = _load_config(work_dir).get("export_dir")
+    except (OSError, ValueError):
+        return None
+    return Path(d) if d else None
 
 
 def process_page(input_dir: Path, image_path: Path, work_dir: Path, *, force: bool = False,

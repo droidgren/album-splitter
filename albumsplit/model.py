@@ -45,6 +45,8 @@ class Photo:
     # (see effective_caption / effective_date).
     caption: str | None = None
     date: str | None = None
+    # Clockwise turn (0/90/180/270) applied at export, for a print mounted sideways.
+    rotation: int = 0
 
     def bbox(self) -> tuple[float, float, float, float]:
         """Axis-aligned bounding box as (x0, y0, x1, y1)."""
@@ -127,7 +129,8 @@ class Page:
                       needs_review=p.get("needs_review", False),
                       outline=[tuple(c) for c in p["outline"]] if p.get("outline") else None,
                       stamp=DateStamp.from_dict(p["stamp"]) if p.get("stamp") else None,
-                      caption=p.get("caption"), date=p.get("date"))
+                      caption=p.get("caption"), date=p.get("date"),
+                      rotation=round(float(p.get("rotation") or 0) / 90) * 90 % 360)
                 for p in d.get("photos", [])
             ],
             texts=[

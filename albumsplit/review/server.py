@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import string
+import subprocess
 import sys
 import threading
 import time
@@ -20,11 +21,12 @@ from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..imageio import IMAGE_EXTS, downscale, find_images, load_bgr
-from ..llm import DEFAULT_MODEL
+from ..llm import DEFAULT_MODEL, MODELS
 from ..model import Page, assign_page_ids, derived_caption, derived_date
-from ..pipeline import load_input_dir, page_json_path, save_input_dir
+from ..pipeline import (load_export_dir, load_input_dir, load_llm_model, page_json_path,
+                        save_export_dir, save_input_dir, save_llm_model)
 from .geometry import normalize
-from .jobs import DetectJob
+from .jobs import DetectJob, ExportJob
 
 STATIC = Path(__file__).parent / "static"
 PREVIEW_LONG_SIDE = 3000
@@ -38,6 +40,14 @@ def preview_path(work_dir: Path, page_id: str) -> Path:
 
 def default_config_dir() -> Path:
     return Path.home() / ".albumsplit"
+
+
+def _content(page: Page) -> dict:
+    """What a reviewer can change on a page, without the review status itself."""
+    d = page.to_dict()
+    d.pop("status")
+    d.pop("edited")
+    return d
 
 
 def _inside(child: Path, parent: Path) -> bool:
@@ -55,7 +65,10 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
     lock = threading.Lock()          # page JSON writes
     llm_lock = threading.Lock()      # creating the Claude client
     preview_locks: dict[str, threading.Lock] = {}
-    st: dict = {"work": None, "input": None, "job": None, "llm": None}
+    st: dict = {"work": None, "input": None, "job": None, "llms": {}, "export": None,
+                "exiftool": None}
+    # The CLI's --llm-model is the default; the start page can choose another per project.
+    model_ids = [m[0] for m in MODELS] + ([llm_model] if llm_model not in {m[0] for m in MODELS} else [])
 
     # ---------- project ----------
 
@@ -95,6 +108,9 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
         job = st["job"]
         if job is not None and job.running and (job.work_dir != work):
             raise HTTPException(409, "Detection is running for another project.")
+        ex = st["export"]
+        if ex is not None and ex.running and ex.work_dir != work:
+            raise HTTPException(409, "An export is running for another project.")
         work.mkdir(parents=True, exist_ok=True)
         if load_input_dir(work) != inp:
             save_input_dir(work, inp)
@@ -133,14 +149,37 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
             counts["scan_error"] = str(e)
         return counts
 
+    def current_model() -> str:
+        chosen = load_llm_model(st["work"]) if st["work"] is not None else None
+        return chosen if chosen in model_ids else llm_model
+
+    def pending_info(work: Path) -> dict:
+        """Batches not yet collected, from the state file (no API call)."""
+        from ..batch import pending_batches
+        try:
+            pending = pending_batches(work)
+        except (OSError, ValueError, KeyError):
+            pending = []
+        return {"batches": len(pending), "pages": sum(len(b["pages"]) for b in pending)}
+
     def project_info() -> dict:
         job = st["job"]
+        ex = st["export"]
+        models = [{"id": m, "label": m, "note": ""} for m in model_ids]
+        for d in models:
+            for mid, label, note in MODELS:
+                if d["id"] == mid:
+                    d.update(label=label, note=note)
         out = {"work_dir": None, "input_dir": None, "stats": None,
-               "detect": job.status() if job else None, "llm_model": llm_model,
+               "detect": job.status() if job else None, "llm_model": current_model(),
+               "llm_models": models, "pending": None,
+               "export": ex.status() if ex else None, "export_dir": None,
+               "exiftool": exiftool_info(),
                "api_key": bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"))}
         if st["work"] is not None and st["input"] is not None:
             out.update(work_dir=str(st["work"]), input_dir=str(st["input"]),
-                       stats=stats(st["work"], st["input"]))
+                       stats=stats(st["work"], st["input"]), pending=pending_info(st["work"]),
+                       export_dir=str(load_export_dir(st["work"]) or st["work"] / "export"))
         return out
 
     @app.get("/api/project")
@@ -201,27 +240,72 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
 
     # ---------- detection ----------
 
-    def linker():
+    def linker(model: str | None = None):
+        """The Claude client for a model (default: the project's), created on first use."""
+        model = model or current_model()
         with llm_lock:
-            if st["llm"] is None:
+            if model not in st["llms"]:
                 from ..llm import LlmLinker, LlmUnavailable
                 try:
-                    st["llm"] = LlmLinker(llm_model)
+                    st["llms"][model] = LlmLinker(model)
                 except LlmUnavailable as e:
                     raise HTTPException(503, str(e)) from e
-            return st["llm"]
+            return st["llms"][model]
+
+    @app.post("/api/settings")
+    def post_settings(body: dict = Body(...)) -> dict:
+        work, _ = project()
+        model = body.get("llm_model")
+        if model is not None:
+            if model not in model_ids:
+                raise HTTPException(422, f"Unknown model {model!r}")
+            save_llm_model(work, model)
+        return project_info()
 
     @app.post("/api/detect")
     def start_detect(body: dict = Body(default={})) -> dict:
         work, inp = project()
-        job = st["job"]
-        if job is not None and job.running:
-            raise HTTPException(409, "Detection is already running")
+        busy()
         llm = linker() if body.get("llm") else None
         st["job"] = DetectJob(input_dir=inp, work_dir=work, redo=bool(body.get("redo")),
-                              force=bool(body.get("force")), llm=llm)
+                              force=bool(body.get("force")), llm=llm,
+                              batch=bool(body.get("llm") and body.get("batch")))
         st["job"].start()
         return project_info()
+
+    # ---------- Claude batches ----------
+
+    @app.get("/api/batches")
+    def get_batches() -> list[dict]:
+        """Batches not yet collected, with their progress (asks the API)."""
+        from ..batch import batch_status, pending_batches
+        work, _ = project()
+        out = []
+        for entry in pending_batches(work):
+            try:
+                out.append(batch_status(linker(entry["model"]), entry))
+            except HTTPException:
+                raise
+            except Exception as e:  # network trouble: report, keep the others
+                out.append({"id": entry["id"], "model": entry["model"], "pages": len(entry["pages"]),
+                            "submitted": entry.get("submitted"), "status": "unknown", "error": str(e)})
+        return out
+
+    @app.post("/api/batches/collect")
+    def collect_batches() -> dict:
+        """Apply the answers of every ended batch to its pages."""
+        from ..batch import collect, pending_batches
+        work, _ = project()
+        job = st["job"]
+        if job is not None and job.running:
+            raise HTTPException(409, "Detection is running; collect when it has finished.")
+        log: list[str] = []
+        updated = kept = 0
+        for model in sorted({b["model"] for b in pending_batches(work)}):
+            u, k = collect(linker(model), work, debug=True, log=log.append)
+            updated, kept = updated + u, kept + k
+        return {"updated": updated, "not_updated": kept, "log": log,
+                "pending": pending_info(work), "project": project_info()}
 
     @app.get("/api/detect")
     def detect_status() -> dict | None:
@@ -232,6 +316,67 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
         if st["job"]:
             st["job"].cancel()
         return detect_status()
+
+    # ---------- export ----------
+
+    def exiftool_info() -> dict:
+        """Whether exiftool can be run (looked up once per server)."""
+        if st["exiftool"] is None:
+            from ..exiftool import ExiftoolError, find_exiftool, version
+            cmd = find_exiftool()
+            info = {"found": False, "version": None, "cmd": cmd}
+            if cmd:
+                try:
+                    info.update(found=True, version=version(cmd))
+                except (ExiftoolError, OSError, subprocess.SubprocessError) as e:
+                    info["error"] = str(e)
+            st["exiftool"] = info
+        return {k: v for k, v in st["exiftool"].items() if k != "cmd"}
+
+    def busy() -> None:
+        for key, what in (("job", "Detection"), ("export", "An export")):
+            j = st[key]
+            if j is not None and j.running:
+                raise HTTPException(409, f"{what} is running; wait for it or cancel it.")
+
+    @app.post("/api/export")
+    def start_export(body: dict = Body(default={})) -> dict:
+        work, inp = project()
+        busy()
+        raw = (body.get("out_dir") or "").strip()
+        if not raw:
+            raise HTTPException(422, "Choose an export folder")
+        out = Path(raw).expanduser().resolve()
+        if out == inp.resolve() or _inside(out, inp):
+            raise HTTPException(422, "The export folder must not be inside the scan folder "
+                                     "(the scans are never written to).")
+        if out.exists() and not out.is_dir():
+            raise HTTPException(422, f"Not a folder: {out}")
+        tool = None
+        if body.get("metadata", True):
+            exiftool_info()
+            if not st["exiftool"]["found"]:
+                raise HTTPException(422, "exiftool was not found, so captions and dates cannot be "
+                                         "written into the photos. Install it (or set "
+                                         "ALBUMSPLIT_EXIFTOOL) and restart, or untick that option.")
+            tool = st["exiftool"]["cmd"]
+        out.mkdir(parents=True, exist_ok=True)
+        save_export_dir(work, out)
+        st["export"] = ExportJob(input_dir=inp, work_dir=work, out_dir=out,
+                                 include_proposed=bool(body.get("all")),
+                                 cards=bool(body.get("cards", True)), exiftool=tool)
+        st["export"].start()
+        return project_info()
+
+    @app.get("/api/export")
+    def export_status() -> dict | None:
+        return st["export"].status() if st["export"] else None
+
+    @app.post("/api/export/cancel")
+    def cancel_export() -> dict | None:
+        if st["export"]:
+            st["export"].cancel()
+        return export_status()
 
     # ---------- pages ----------
 
@@ -311,8 +456,10 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
             # Fields the UI cannot change come from disk.
             new.source, new.width, new.height = old.source, old.width, old.height
             new.detector_version, new.linker = old.detector_version, old.linker
-            new.edited = True
             normalize(new, old)
+            # "edited" protects work done in review from re-detection, so it means a real
+            # change: approving, un-approving or a save that changes nothing does not count.
+            new.edited = old.edited or _content(new) != _content(old)
             new.save(path)
         return with_derived(new)
 
@@ -333,7 +480,7 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
             page.save(path)
         return with_derived(page, llm_result={
             "transcribed": sum(1 for t in page.texts if t.transcription),
-            "issues": len(res.issues)})
+            "issues": len(res.issues), "model": llm.model})
 
     @app.post("/api/pages/{page_id}/photos/{photo_id}/stamp")
     def llm_stamp(page_id: str, photo_id: int) -> dict:
@@ -360,7 +507,8 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
             with lock:
                 page.edited = True
                 page.save(path)
-        return with_derived(page, stamp_result={"found": ans.found, "text": ans.text, "date": ans.date})
+        return with_derived(page, stamp_result={"found": ans.found, "text": ans.text, "date": ans.date,
+                                                "model": ans.model})
 
     @app.get("/api/pages/{page_id}/image")
     def page_image(page_id: str) -> FileResponse:
