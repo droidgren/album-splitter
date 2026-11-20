@@ -6,6 +6,7 @@ full-resolution pixel coordinates of the (EXIF-oriented) source image.
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass, field
 
 import cv2
@@ -37,6 +38,7 @@ class Params:
     split_max_hull: float = 0.82    # split blobs less convex than this ...
     split_clear_bite: float = 0.9   # ... or whose missing area is at least this much clean paper
     max_aspect: float = 4.0
+    frame_merge_reach: float = 0.12  # pieces this close (x long side) may be one framed print
     # text
     photo_margin_frac: float = 0.004
     ink_dark: float = 32.0          # darkness vs local background for any ink
@@ -337,6 +339,79 @@ def _best_seam(mask: np.ndarray, grad: tuple[np.ndarray, np.ndarray], axis: str,
     return best
 
 
+def _split_at_paper_lines(comp: np.ndarray, paperlike: np.ndarray,
+                          grad: tuple[np.ndarray, np.ndarray], p: Params, min_area: float,
+                          depth: int = 0) -> list[np.ndarray] | None:
+    """Split prints that touch along a full side, with only a hairline of paper between them.
+
+    Two prints of the same width laid edge to edge make one perfect rectangle in the colour
+    mask (the opening closes the hairline). The hairline is still there: a row (or column) of
+    paper colour right across the blob, with straight print edges along it. A horizon or a
+    table edge inside one print is a step between two colours, not a line of paper.
+    Prints are assumed to be roughly axis-aligned. Returns the pieces (each a clean
+    rectangle), or None.
+    """
+    if depth > 3:
+        return None
+    ys, xs = np.nonzero(comp)
+    if ys.size == 0:
+        return None
+    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    across_y = np.abs(grad[1]) - np.abs(grad[0])
+    best: tuple[float, str, int] | None = None
+    for axis in ("y", "x"):
+        lo, hi = (y0, y1) if axis == "y" else (x0, x1)
+        span = hi - lo
+        m = 0.08 * span  # not at the blob's own ends
+        for q in range(int(lo + m), int(hi - m)):
+            line = comp[q, x0:x1] if axis == "y" else comp[y0:y1, q]
+            inside = np.nonzero(line)[0]
+            if inside.size < 0.6 * ((x1 - x0) if axis == "y" else (y1 - y0)):
+                continue
+            # (+-4 px: the hairline between two slightly rotated prints is a little tilted)
+            if axis == "y":
+                pl = paperlike[max(0, q - 4):q + 5, x0:x1].max(axis=0)[inside]
+            else:
+                pl = paperlike[y0:y1, max(0, q - 4):q + 5].max(axis=1)[inside]
+            frac = float(pl.mean())
+            if frac < 0.8:
+                continue
+            # straight edges just beside the line (either side)
+            strength = 0.0
+            for o in (-4, -3, -2, -1, 1, 2, 3, 4):
+                r = q + o
+                if axis == "y" and 0 <= r < comp.shape[0]:
+                    g = across_y[r, x0:x1][inside]
+                elif axis == "x" and 0 <= r < comp.shape[1]:
+                    g = -across_y[y0:y1, r][inside]
+                else:
+                    continue
+                strength = max(strength, float(np.percentile(g, 30)))
+            if strength >= 2 * p.snap_min_grad and (best is None or frac > best[0]):
+                best = (frac, axis, q)
+    if best is None:
+        return None
+    _, axis, q = best
+    a, b = comp.copy(), comp.copy()
+    if axis == "y":
+        a[q:, :] = 0
+        b[:q + 1, :] = 0
+    else:
+        a[:, q:] = 0
+        b[:, :q + 1] = 0
+    pieces = []
+    for half in (a, b):
+        if cv2.countNonZero(half) < 0.5 * min_area:
+            return None
+        sub = _split_at_paper_lines(half, paperlike, grad, p, min_area, depth + 1)
+        pieces.extend(sub or [half])
+    # Only a clean cut into whole prints is taken here; blobs of overlapping prints that need
+    # more than straight cuts are left to _try_split.
+    if any(_mask_rectangularity(pc) < p.good_rect for pc in pieces):
+        return None
+    return pieces
+
+
 def _bite_paper(mask: np.ndarray, paper_strict: np.ndarray) -> float:
     """Fraction of clean paper in the part of the blob's bounding rectangle the blob misses.
 
@@ -459,6 +534,132 @@ def _merge_fragments(fg: np.ndarray, paper_strict: np.ndarray, p: Params) -> np.
             if changed:
                 break
     return out
+
+
+def _merge_framed(fg: np.ndarray, grad: tuple[np.ndarray, np.ndarray], paperlike: np.ndarray,
+                  paper_strict: np.ndarray, p: Params) -> np.ndarray:
+    """Join pieces of one print separated by paper-coloured content (snow, a white blanket).
+
+    _merge_fragments leaves these apart: clean paper colour between pieces is also what
+    separates two prints. What tells one print apart is its frame. A piece is tried together
+    with its 1, 2, 3 nearest neighbours (a print can fall apart into several pieces around a
+    white area, and only all of them together span it); the group is one print if the
+    rectangle around it, snapped to the edges, is framed by print edges on all four sides and
+    no straight seam runs across it (`_frames_one_print`). The rectangle is filled in whole.
+    """
+    h, w = fg.shape
+    reach = p.frame_merge_reach * max(h, w)
+    out = fg.copy()
+    contours, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    parts = [c for c in contours if cv2.contourArea(c) >= 0.003 * h * w]
+    # A piece that is already a whole print (rectangular, framed all round) is no fragment:
+    # inside a bigger print its own border would be a seam. Leaving those out saves most of
+    # the (costly) tries.
+    def whole(c: np.ndarray) -> bool:
+        r = _region(c, (h, w))
+        return r.rectangularity >= p.good_rect and _framed_sides(r.rect, grad, p) == 4
+    parts = [c for c in parts if not whole(c)]
+    parts.sort(key=cv2.contourArea, reverse=True)
+
+    def gap_between(a: tuple, b: tuple) -> float:
+        dx = max(0, max(a[0], b[0]) - min(a[0] + a[2], b[0] + b[2]))
+        dy = max(0, max(a[1], b[1]) - min(a[1] + a[3], b[1] + b[3]))
+        return float(np.hypot(dx, dy))
+
+    tried: set[frozenset] = set()
+    changed = True
+    while changed:
+        changed = False
+        boxes = [cv2.boundingRect(c) for c in parts]
+        for i in range(len(parts)):
+            near = sorted((gap_between(boxes[i], boxes[j]), j) for j in range(len(parts))
+                          if j != i and gap_between(boxes[i], boxes[j]) <= reach)[:4]
+            groups = [[i, *combo] for k in (1, 2, 3)
+                      for combo in itertools.combinations([j for _, j in near], k)]
+            for group in groups:
+                key = frozenset(cv2.boundingRect(parts[m]) for m in group)
+                if key in tried:
+                    continue
+                tried.add(key)
+                union = np.vstack([parts[m] for m in group])
+                (rw, rh) = cv2.minAreaRect(union)[1]
+                if max(rw, rh) / max(min(rw, rh), 1) > p.max_aspect:
+                    continue
+                pieces = np.zeros((h, w), np.uint8)
+                cv2.drawContours(pieces, [parts[m] for m in group], -1, 255, cv2.FILLED)
+                rect = _frames_one_print(union, pieces, grad, paperlike, paper_strict, p)
+                if rect is None:
+                    continue
+                box = cv2.boxPoints(rect).astype(np.int32)
+                cv2.fillPoly(out, [box], 255)
+                parts = [c for m, c in enumerate(parts) if m not in group] + [box.reshape(-1, 1, 2)]
+                changed = True
+                break
+            if changed:
+                break
+    return out
+
+
+def _frames_one_print(union: np.ndarray, pieces: np.ndarray, grad: tuple[np.ndarray, np.ndarray],
+                      paperlike: np.ndarray, paper_strict: np.ndarray, p: Params) -> tuple | None:
+    """The print rectangle around a group of pieces, if they are one print (else None).
+
+    One print: its rectangle, snapped to the edges, shows a print edge along all four sides.
+    Two prints with a narrow paper gap between them can pass that too (the gap is a small part
+    of each side), but each shows its own straight edge along the gap: a seam running right
+    across the rectangle, between the pieces. (The seam test is cheap, the snapping is not:
+    it runs first, on the unsnapped rectangle, too.)
+    """
+    rect = cv2.minAreaRect(union)
+    if _seam_across(rect, pieces, grad, p):
+        return None
+    rect, unconfirmed = _snap_rect(rect, grad, paperlike, paper_strict, p)
+    (rw, rh) = rect[1]
+    if unconfirmed or min(rw, rh) < 1 or max(rw, rh) / min(rw, rh) > p.max_aspect:
+        return None
+    if _framed_sides(rect, grad, p) < 4 or _seam_across(rect, pieces, grad, p):
+        return None
+    return rect
+
+
+def _seam_across(rect: tuple, pieces: np.ndarray, grad: tuple[np.ndarray, np.ndarray], p: Params
+                 ) -> bool:
+    """True if a straight edge runs right across the rect where the pieces leave it open.
+
+    Stays clear of the rect's own sides (a print's border texture runs along them). A seam
+    between two prints is a straight edge: strong, and the gradient runs across it, not along.
+    Busy content (foliage, a treeline) has strong gradients in every direction.
+    """
+    gx, gy = grad
+    h, w = gx.shape
+    bx = cv2.boxPoints(rect)
+    x0, x1 = int(max(1, bx[:, 0].min() + 4)), int(min(w - 2, bx[:, 0].max() - 4))
+    y0, y1 = int(max(1, bx[:, 1].min() + 4)), int(min(h - 2, bx[:, 1].max() - 4))
+    if x1 - x0 < 20 or y1 - y0 < 20:
+        return False
+    inside = np.zeros((h, w), np.uint8)
+    cv2.fillPoly(inside, [bx.astype(np.int32)], 255)
+    gap = (inside[y0:y1, x0:x1] > 0) & (pieces[y0:y1, x0:x1] == 0)
+    if not gap.any():
+        return False
+    my, mx = max(6, int(0.04 * (y1 - y0))), max(6, int(0.04 * (x1 - x0)))
+    strong = 2 * p.snap_min_grad
+    across = np.abs(gy[y0 - 1:y1 + 1, x0:x1]) - np.abs(gx[y0 - 1:y1 + 1, x0:x1])
+    # horizontal seams (+-1 row: slightly rotated prints), on rows the pieces leave open
+    rows = np.nonzero(gap.any(axis=1))[0]
+    rows = rows[(rows >= my) & (rows <= y1 - y0 - my)]
+    if rows.size:
+        g = np.maximum(np.maximum(across[rows], across[rows + 1]), across[rows + 2])
+        if (np.percentile(g, 30, axis=1) >= strong).any():
+            return True
+    across = np.abs(gx[y0:y1, x0 - 1:x1 + 1]) - np.abs(gy[y0:y1, x0 - 1:x1 + 1])
+    cols = np.nonzero(gap.any(axis=0))[0]
+    cols = cols[(cols >= mx) & (cols <= x1 - x0 - mx)]
+    if cols.size:
+        g = np.maximum(np.maximum(across[:, cols], across[:, cols + 1]), across[:, cols + 2])
+        if (np.percentile(g, 30, axis=0) >= strong).any():
+            return True
+    return False
 
 
 def _edge_strength(lab: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -668,13 +869,14 @@ def detect_photos(lab: np.ndarray, paper: np.ndarray, p: Params
     dist = paper_distance(lab, paper, p.paper_l_weight)
     paperlike = (dist <= p.paper_dist).astype(np.float32)
     paper_strict = (dist <= p.paper_dist * 0.5).astype(np.float32)
+    grad = _edge_strength(lab)
     fg = _merge_fragments(_foreground(dist, p), paper_strict, p)
+    fg = _merge_framed(fg, grad, paperlike, paper_strict, p)
     page_hull = _page_hull(paper_strict)
     min_area = p.min_photo_frac * h * w
     photo_mask = np.zeros((h, w), np.uint8)
     nonpage = np.zeros((h, w), np.uint8)
     found: list[tuple[np.ndarray, bool]] = []
-    grad = _edge_strength(lab)
 
     def accept(contour: np.ndarray, review: bool, siblings: np.ndarray | None = None) -> None:
         rect, unconfirmed = _snap_rect(cv2.minAreaRect(contour), grad, paperlike, paper_strict, p,
@@ -684,6 +886,18 @@ def detect_photos(lab: np.ndarray, paper: np.ndarray, p: Params
             review = False  # whatever made it look odd, the print border runs all the way round
         found.append((box, review or unconfirmed >= 2))
         cv2.fillPoly(photo_mask, [box.astype(np.int32)], 255)
+
+    def accept_pieces(pieces: list[np.ndarray]) -> None:
+        for i, piece in enumerate(pieces):
+            cs, _ = cv2.findContours(piece, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            pc = max(cs, key=cv2.contourArea)
+            pr = _region(pc, (h, w))
+            siblings = np.zeros((h, w), np.uint8)
+            for j, other in enumerate(pieces):
+                if j != i:
+                    siblings |= cv2.dilate(other, ellipse(7))
+            if pr.area >= min_area * 0.5 and pr.aspect <= p.max_aspect:
+                accept(pc, pr.rectangularity < p.good_rect, siblings)
 
     def covered(contour: np.ndarray) -> float:
         m = np.zeros((h, w), np.uint8)
@@ -705,7 +919,14 @@ def detect_photos(lab: np.ndarray, paper: np.ndarray, p: Params
             continue
         comp = np.zeros((h, w), np.uint8)
         cv2.drawContours(comp, [c], -1, 255, cv2.FILLED)
-        bites_are_paper = _bite_paper(comp, paper_strict) >= p.bite_paper
+        pieces = _split_at_paper_lines(comp, paperlike, grad, p, min_area)
+        if pieces:
+            accept_pieces(pieces)
+            continue
+        # Other prints inside the blob's rectangle are not light content of this one: as far
+        # as telling one print from several goes, they count as paper.
+        strict_c = np.maximum(paper_strict, ((fg > 0) & (comp == 0)).astype(np.float32))
+        bites_are_paper = _bite_paper(comp, strict_c) >= p.bite_paper
         if r.aspect <= p.max_aspect and (r.rectangularity >= p.good_rect or r.hull_rectangularity >= 0.95
                                          or not bites_are_paper):
             # Bites out of the rectangle that are not clean paper (sky, white walls) mean one
@@ -716,18 +937,9 @@ def detect_photos(lab: np.ndarray, paper: np.ndarray, p: Params
             # Paper-coloured bites, but the print border runs all the way round: one print.
             accept(c, True)
             continue
-        pieces = _try_split(comp, min_area, p, paper_strict, grad)
+        pieces = _try_split(comp, min_area, p, strict_c, grad)
         if pieces:
-            for i, piece in enumerate(pieces):
-                cs, _ = cv2.findContours(piece, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                pc = max(cs, key=cv2.contourArea)
-                pr = _region(pc, (h, w))
-                siblings = np.zeros((h, w), np.uint8)
-                for j, other in enumerate(pieces):
-                    if j != i:
-                        siblings |= cv2.dilate(other, ellipse(7))
-                if pr.area >= min_area * 0.5 and pr.aspect <= p.max_aspect:
-                    accept(pc, pr.rectangularity < p.good_rect, siblings)
+            accept_pieces(pieces)
             continue
         if r.rectangularity >= p.min_rect and r.aspect <= p.max_aspect:
             accept(c, True)
@@ -821,7 +1033,17 @@ def detect_texts(lab: np.ndarray, paper: np.ndarray, photo_mask: np.ndarray,
     excluded = cv2.dilate(photo_mask, ellipse(2 * margin + 1)) | cv2.dilate(nonpage, ellipse(2 * margin + 1))
     # Solid shapes (stickers, printed logos) survive an opening that erases pen strokes.
     nonpaper = (paper_distance(lab, paper, p.paper_l_weight) > p.paper_dist).astype(np.uint8) * 255
-    solid = cv2.morphologyEx(nonpaper, cv2.MORPH_OPEN, ellipse(int(long_side * p.solid_frac) | 1))
+    k_solid = int(long_side * p.solid_frac) | 1
+    solid = cv2.morphologyEx(nonpaper, cv2.MORPH_OPEN, ellipse(k_solid))
+    # Bold marker strokes survive that opening too, but only just: a solid shape is thicker
+    # than the kernel somewhere (the star sticker on the samples: 35 px from its centre to its
+    # edge; marker writing: at most 8 px).
+    thick = cv2.distanceTransform(nonpaper, cv2.DIST_L2, 5)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(solid, connectivity=8)
+    if n > 1:
+        peak = np.zeros(n, np.float32)
+        np.maximum.at(peak, labels.ravel(), thick.ravel())
+        solid = ((peak >= k_solid)[labels] & (labels > 0)).astype(np.uint8) * 255
     excluded |= cv2.dilate(solid, ellipse(2 * margin + 1))
     ink[excluded > 0] = 0
     if cv2.countNonZero(nonpage) > 0.03 * nonpage.size:
@@ -873,7 +1095,7 @@ def detect_texts(lab: np.ndarray, paper: np.ndarray, photo_mask: np.ndarray,
         bw, bh = x1 - x0, y1 - y0
         if bh > 6 * bw or bw > 25 * bh:
             continue  # page/scanner edge, not handwriting
-        if bw * bh > 0.15 * h * w or cnt / (bw * bh) > 0.4:
+        if bw * bh > 0.15 * h * w or cnt / (bw * bh) > 0.55:  # (bold marker writing: ~0.43)
             continue  # an undetected photo or printed graphic, not a caption
         if bw > 2.5 * bh and _is_single_stroke(member[y0:y1, x0:x1]):
             continue  # an arrow or a line, not writing
@@ -883,21 +1105,16 @@ def detect_texts(lab: np.ndarray, paper: np.ndarray, photo_mask: np.ndarray,
             edge_marks.append(box)  # punch-hole remnant -- or the first letter of a caption
         else:
             boxes.append(box)
-    merged = _merge_lines(_merge_boxes(boxes + edge_marks, gap=max(2, int(long_side * 0.003))),
-                          ink, photo_mask)
+    pieces = _merge_boxes(boxes + edge_marks, gap=max(2, int(long_side * 0.003)))
+    merged = _merge_lines(_split_at_photo_gaps(pieces, ink, photo_mask), ink, photo_mask, blue)
     # Keep a small mark at the binding edge only if it joined a caption ("D" of "David");
     # left on its own it is a punch hole or its shadow.
-    real = [_center(b) for b in boxes]
-    merged = [b for b in merged if any(_contains(b, c) for c in real)]
+    merged = [b for b in merged if any(_overlaps(b, r) for r in boxes)]
     return merged
 
 
-def _center(b: tuple[int, int, int, int]) -> tuple[float, float]:
-    return b[0] + b[2] / 2, b[1] + b[3] / 2
-
-
-def _contains(b: tuple[int, int, int, int], pt: tuple[float, float]) -> bool:
-    return b[0] <= pt[0] <= b[0] + b[2] and b[1] <= pt[1] <= b[1] + b[3]
+def _overlaps(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
+    return a[0] < b[0] + b[2] and b[0] < a[0] + a[2] and a[1] < b[1] + b[3] and b[1] < a[1] + a[3]
 
 
 def _add_margin(boxes: list[tuple[int, int, int, int]], blocked: np.ndarray, margin: int
@@ -946,15 +1163,93 @@ def _line_height(ink: np.ndarray, r: list[int]) -> float:
     return float(np.median(hs)) if hs else float(r[3] - r[1])
 
 
-def _merge_lines(boxes: list[tuple[int, int, int, int]], ink: np.ndarray, photo_mask: np.ndarray
-                 ) -> list[tuple[int, int, int, int]]:
+def _between_photos(a: list[int], b: list[int], photo_mask: np.ndarray) -> bool:
+    """True if the gap between two pieces on one line continues a gap between two photos
+    right above or below them, and both pieces are caption-sized (not a word or two): then
+    each piece is the caption of its own photo."""
+    h, w = photo_mask.shape
+    long_side = max(h, w)
+    if min(a[2] - a[0], b[2] - b[0]) < 0.12 * long_side:
+        return False  # a few words next to a caption are more likely part of it
+    band = max(8, int(0.04 * long_side))
+    left, right = (a, b) if a[0] <= b[0] else (b, a)
+    g0, g1 = left[2], right[0]
+    top, bottom = min(a[1], b[1]), max(a[3], b[3])
+    for y0, y1 in ((max(0, top - band), top), (bottom, min(h, bottom + band))):
+        if y1 <= y0:
+            continue
+        cols = photo_mask[y0:y1].any(axis=0)
+        if cols[left[0]:left[2]].any() and cols[right[0]:right[2]].any() and                 g1 > g0 and not cols[g0:g1].all():
+            # photo above (below) each piece, and paper somewhere in the gap between them
+            xs_left = np.nonzero(cols[left[0]:g1])[0]
+            xs_right = np.nonzero(cols[g0:right[2]])[0]
+            free = np.nonzero(~cols[g0:g1])[0] + g0
+            if xs_left.size and xs_right.size and                     (free > xs_left.min() + left[0]).any() and (free < xs_right.max() + g0).any():
+                return True
+    return False
+
+
+def _split_at_photo_gaps(boxes: list[tuple[int, int, int, int]], ink: np.ndarray,
+                         photo_mask: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """Split blocks that the dilation joined across a gap between two photos.
+
+    Two captions side by side under two neighbouring photos can sit closer than the dilation
+    reaches. Where a block spans the continuation of the paper gap between two photos (right
+    above or below it) and its ink leaves an empty column there, it is cut in two -- if both
+    halves are caption-sized (`_between_photos`).
+    """
+    h, w = photo_mask.shape
+    band = max(8, int(0.04 * max(h, w)))
+    out = []
+    for x, y, bw, bh in boxes:
+        cut = None
+        for y0, y1 in ((max(0, y - band), y), (y + bh, min(h, y + bh + band))):
+            if y1 <= y0:
+                continue
+            cols = photo_mask[y0:y1, x:x + bw].any(axis=0)
+            if cols.all() or not cols.any():
+                continue
+            empty = ~ink[y:y + bh, x:x + bw].any(axis=0)
+            on = np.nonzero(cols)[0]
+            # photo-free columns between photo columns: a gap between two photos
+            for c in np.nonzero(~cols)[0]:
+                if on.min() < c < on.max() and empty[c]:
+                    cut = c
+                    break
+            if cut is not None:
+                break
+        if cut is None:
+            out.append((x, y, bw, bh))
+            continue
+        parts = []
+        for a0, a1 in ((0, cut), (cut + 1, bw)):
+            ys, xs = np.nonzero(ink[y:y + bh, x + a0:x + a1])
+            if xs.size:
+                parts.append([x + a0 + xs.min(), y + ys.min(), x + a0 + xs.max() + 1, y + ys.max() + 1])
+        if len(parts) == 2 and _between_photos(parts[0], parts[1], photo_mask):
+            out.extend((r[0], r[1], r[2] - r[0], r[3] - r[1]) for r in parts)
+        else:
+            out.append((x, y, bw, bh))
+    return out
+
+
+def _ink_blue(ink: np.ndarray, blue: np.ndarray, r: list[int]) -> float:
+    """Median blueness (b* below the paper's) of the ink in a box."""
+    m = ink[r[1]:r[3], r[0]:r[2]] > 0
+    return float(np.median(blue[r[1]:r[3], r[0]:r[2]][m])) if m.any() else 0.0
+
+
+def _merge_lines(boxes: list[tuple[int, int, int, int]], ink: np.ndarray, photo_mask: np.ndarray,
+                 blue: np.ndarray | None = None) -> list[tuple[int, int, int, int]]:
     """Join pieces of one caption that the fixed-size dilation left apart.
 
     Large or widely spaced handwriting leaves gaps between words and lines that scale with
     the writing, so gaps are measured in line heights (not box heights: a two-line caption
     is twice as tall but written no larger). Words on the same line are joined when the gap
     is under 2.2 line heights (separate captions sit ~4 or more apart); stacked lines when they overlap horizontally and the gap is
-    under 1 line height (separate captions sit ~2 or more apart). Never across a photo.
+    under 1 line height (separate captions sit ~2 or more apart). Never across a photo, and
+    never between a blue ballpoint and a neutral (black/grey) piece: one caption is written with
+    one pen, and printed matter next to a caption (a cut-out ticket) is neutral.
     """
     rects = [[x, y, x + bw, y + bh] for x, y, bw, bh in boxes]
     merged = True
@@ -978,6 +1273,12 @@ def _merge_lines(boxes: list[tuple[int, int, int, int]], ink: np.ndarray, photo_
                            and 0 <= v_gap <= 1.0 * line_h)
                 if not (same_line or stacked):
                     continue
+                if same_line and not stacked and h_gap > 0 and _between_photos(a, b, photo_mask):
+                    continue  # side by side under (or over) two photos: one caption each
+                if blue is not None:
+                    ba, bb = _ink_blue(ink, blue, a), _ink_blue(ink, blue, b)
+                    if max(ba, bb) > 8 and abs(ba - bb) > 8:
+                        continue  # different pens
                 u = [min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])]
 
                 def on_photo(r: list[int]) -> int:

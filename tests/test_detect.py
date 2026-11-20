@@ -116,3 +116,41 @@ def test_text_margin_stops_at_photos_and_page_edge():
     assert _add_margin([(50, 40, 20, 10)], blocked, 5) == [(45, 35, 30, 20)]
     assert _add_margin([(130, 40, 18, 10)], blocked, 5) == [(125, 35, 25, 20)]
     assert _add_margin([(2, 1, 10, 10)], blocked, 5) == [(0, 0, 17, 16)]
+
+
+def _bbox(ph) -> tuple[float, float, float, float]:
+    xs = [p[0] for p in ph.corners]
+    ys = [p[1] for p in ph.corners]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def test_touching_prints_split_at_hairline():
+    """Two prints of the same width laid edge to edge, a hairline of paper between them
+    (~7 px at full resolution, as on the samples)."""
+    page = np.full((PAGE_H, PAGE_W, 3), PAPER, np.uint8)
+    page[300:1300, 400:2000] = make_print(1600, 1000, seed=11)
+    page[1307:2400, 400:2000] = make_print(1600, 1093, seed=12)
+    det = detect_page(page)
+    boxes = sorted(_bbox(ph) for ph in det.photos)
+    assert len(boxes) == 2, boxes
+    (_, a0, _, a1), (_, b0, _, b1) = sorted(boxes, key=lambda b: b[1])
+    assert abs(a0 - 300) < 25 and abs(a1 - 1300) < 25
+    assert abs(b0 - 1307) < 25 and abs(b1 - 2400) < 25
+
+
+def test_print_cut_by_paper_white_band_stays_one():
+    """Snow or a white blanket right across a print: the colour mask sees two pieces with
+    paper colour between them; the print's frame says it is one."""
+    page = np.full((PAGE_H, PAGE_W, 3), PAPER, np.uint8)
+    img = make_print(1500, 1200, seed=13)
+    xs = np.arange(1500)
+    top = (450 + 40 * np.sin(xs / 90.0)).astype(int)  # snow has no straight outline
+    bottom = (760 + 50 * np.sin(xs / 130.0 + 1.0)).astype(int)
+    for x in xs:
+        img[top[x]:bottom[x], x] = PAPER  # paper-coloured band right across the print
+    page[400:1600, 400:1900] = img
+    cv2.rectangle(page, (400, 400), (1899, 1599), (150, 150, 150), 2)  # print edge shadow
+    det = detect_page(page)
+    assert len(det.photos) == 1, [_bbox(ph) for ph in det.photos]
+    x0, y0, x1, y1 = _bbox(det.photos[0])
+    assert abs(x0 - 400) < 25 and abs(y0 - 400) < 25 and abs(x1 - 1900) < 25 and abs(y1 - 1600) < 25

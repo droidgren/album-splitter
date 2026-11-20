@@ -51,6 +51,7 @@ class StampParams:
     year_pivot: int = 70         # two-digit years >= pivot are 19YY, below 20YY
     years: tuple[int, int] = (1975, 2015)  # era of date-imprinting film cameras
     alt_gap: float = 0.5         # keep other dates whose readings cost less extra than this
+    max_mean_cost: float = 1.5   # digits fit worse than this on average: keep text, no date
 
 
 # Seven-segment patterns, segments "abcdefg" (a top, b upper right, c lower right, d bottom,
@@ -118,8 +119,18 @@ def find_stamp(img_bgr: np.ndarray, corners: list[Point], outline: list[Point] |
     best = max(cands, key=lambda c: c.score)
     if best.score < sp.min_score:
         return None
+    if best.date and _mean_cost(best) > sp.max_mean_cost:
+        # A stamp, but the digits are too damaged to trust the date: leave it for review.
+        best.date_alts = [best.date] + best.date_alts
+        best.date = None
     return DateStamp(corners=_box_to_page(best, crop.shape[:2], M), text=best.text, date=best.date,
                      date_alts=best.date_alts, score=round(best.score, 2))
+
+
+def _mean_cost(c: Candidate) -> float:
+    """How badly the chosen digits explain their glyphs, on average (0 = perfectly)."""
+    costs = [g.costs.get(g.char, 3.0) for g in c.glyphs if g.kind == "digit"]
+    return float(np.mean(costs)) if costs else 3.0
 
 
 def harmonize(stamps: list[DateStamp]) -> None:
@@ -295,11 +306,14 @@ def candidates(crop: np.ndarray, valid: np.ndarray, sp: StampParams) -> list[Can
             mask, lo = stamp_mask(db, vb, sp)
             if not mask.any():
                 continue
+            wb, rb = w_[y_off:], r_[y_off:]
             for c in _lines(mask, db, h, lo):
                 best = c
+                _repatch(c, wb, rb)
                 _read(c, sp)
                 c.score = _score(c, cw, sp)
                 for r in _reread(c, db, lo, sp):
+                    _repatch(r, wb, rb)
                     _read(r, sp)
                     r.score = _score(r, cw, sp)
                     if r.score > best.score:
@@ -347,6 +361,35 @@ def _reread(c: Candidate, d: np.ndarray, lo: float, sp: StampParams) -> list[Can
         r.contrast = c.contrast  # judged by the band-wide noise, like every other candidate
         out.append(r)
     return out
+
+
+def _repatch(c: Candidate, warm: np.ndarray, reddish: np.ndarray) -> None:
+    """Measure each glyph's warmth for decoding against the background just above and below
+    the line, per column.
+
+    The detection contrast subtracts a median over about one digit: between two tightly packed
+    bright digits ("96") that window is mostly stroke, and the facing strokes of both digits
+    are subtracted away (the 6 then reads as a 5). Rows above and below the line hold no
+    stamp, so their per-column median is the true background.
+    """
+    h = c.digit_h
+    x0, y0, x1, y1 = c.box
+    pad = int(round(0.6 * h))
+    bx0, bx1 = max(0, x0 - pad), min(warm.shape[1], x1 + pad)
+    above = warm[max(0, int(y0 - 1.0 * h)):max(0, int(y0 - 0.25 * h)), bx0:bx1]
+    below = warm[min(warm.shape[0], int(y1 + 0.25 * h)):min(warm.shape[0], int(y1 + 1.0 * h)),
+                 bx0:bx1]
+    ring = np.concatenate([above, below], axis=0)
+    if ring.shape[0] < 3:
+        return  # no room around the line: keep the detection patches
+    bg = np.median(ring, axis=0).astype(np.float32)
+    k = max(3, int(0.5 * h)) | 1  # smooth across columns (single bright specks)
+    enc = np.clip(bg * 2 + 128, 0, 255).astype(np.uint8)[None, :]
+    bg = (cv2.medianBlur(np.repeat(enc, 3, axis=0), min(k, 255))[1].astype(np.float32) - 128) / 2
+    for g in c.glyphs:
+        p = warm[g.y0:g.y1, g.x0:g.x1] - bg[None, g.x0 - bx0:g.x1 - bx0]
+        p[~reddish[g.y0:g.y1, g.x0:g.x1]] = 0
+        g.patch = np.clip(p, 0, None)
 
 
 def _glyphs(mask: np.ndarray, h: float) -> list[_Glyph]:
@@ -565,7 +608,7 @@ def segment_levels(patch: np.ndarray) -> dict[str, float]:
     return {k: float(np.clip((v - floor) / (top - floor), 0, 1)) for k, v in lv.items()}
 
 
-def _digit_costs(patch: np.ndarray, h: float) -> dict[str, float]:
+def _digit_costs(patch: np.ndarray, h: float, narrow: bool = False) -> dict[str, float]:
     """How badly each digit explains one glyph (0 = perfectly; missing = impossible).
 
     Wide glyphs are read from their segment levels: a digit costs (1 - level) for each
@@ -581,7 +624,7 @@ def _digit_costs(patch: np.ndarray, h: float) -> dict[str, float]:
     gh, gw = patch.shape
     if gh < 0.6 * h:
         return {}
-    if gw < 0.33 * h:
+    if narrow or gw < 0.33 * h:
         prof = patch.mean(axis=1)
         filled = float((prof > 0.25 * prof.max()).mean())
         return {"1": 3 * (1 - filled)} if filled > 0.6 else {}
@@ -613,9 +656,12 @@ def _read(c: Candidate, sp: StampParams) -> None:
     that is a valid date in the camera-date era. If an apostrophe-like speck stands in the
     way of any valid date, the line is read once more without it.
     """
+    # A "1" is one bar where other digits are a box: a glyph much narrower than the line's
+    # other digits is read as a 1 even when glow makes it wider than a bare stroke.
+    one_w = 0.62 * _digit_width(c)
     for g in c.glyphs:
         if g.kind == "digit":
-            g.costs = _digit_costs(g.patch, c.digit_h)
+            g.costs = _digit_costs(g.patch, c.digit_h, narrow=g.x1 - g.x0 < one_w)
             g.char = _best_char(g.costs)
     for use_ticks in (True, False):
         groups, year_field = _fields(c, use_ticks)
@@ -634,9 +680,20 @@ def _read(c: Candidate, sp: StampParams) -> None:
     c.text = " ".join(("'" if i == year_field else "") + f for i, f in enumerate(c.fields))
 
 
+def _digit_width(c: Candidate) -> float:
+    """Typical width of the line's full-width digits (0 if fewer than two)."""
+    widths = [g.x1 - g.x0 for g in c.glyphs if g.kind == "digit" and g.x1 - g.x0 >= 0.5 * c.digit_h]
+    return float(np.median(widths)) if len(widths) >= 2 else 0.0
+
+
 def _fields(c: Candidate, use_ticks: bool) -> tuple[list[list[_Glyph]], int | None]:
-    """Group the digits into fields: a new field after a gap or an apostrophe."""
+    """Group the digits into fields: a new field after a gap or an apostrophe.
+
+    A "1" lights only the right side of its digit cell, so the gap before it is wider by the
+    unlit part of the cell (about half of it counts: "11" must stay one field, "12 12" two).
+    """
     h = c.digit_h
+    dw = _digit_width(c)
     groups: list[list[_Glyph]] = []
     year_field = None
     prev: _Glyph | None = None
@@ -646,7 +703,9 @@ def _fields(c: Candidate, use_ticks: bool) -> tuple[list[list[_Glyph]], int | No
                 year_field = len(groups)
                 prev = g
             continue
-        if not groups or prev is None or prev.kind == "tick" or g.x0 - prev.x1 > 0.4 * h:
+        gw = g.x1 - g.x0
+        unlit = 0.5 * (dw - gw) if gw < 0.62 * dw else 0.0
+        if not groups or prev is None or prev.kind == "tick" or g.x0 - prev.x1 > 0.4 * h + unlit:
             groups.append([])
         groups[-1].append(g)
         prev = g

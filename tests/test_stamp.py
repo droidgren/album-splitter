@@ -166,3 +166,14 @@ def test_harmonize_prefers_the_pages_date_for_a_near_tie():
     assert blurred.date == "1996-05-26" and "1995-05-26" in blurred.date_alts
     assert clear.date == "1996-05-26"
     assert other.date == "1993-05-08"  # its alternative matches nothing: unchanged
+
+
+@pytest.mark.parametrize("text,date", [("'99 11 15", "1999-11-15"), ("6 11 '05", "2005-11-06"),
+                                       ("12 12 '05", "2005-12-12")])
+def test_ones_are_narrow_and_stay_in_their_field(text, date):
+    """A "1" lights only the right side of its cell: it must not read as a wide digit, and
+    the gap before it must not split "11" into two fields."""
+    img = make_print(8)
+    add_stamp(img, text)
+    st = find_stamp(*on_page(img))
+    assert st is not None and st.date == date
