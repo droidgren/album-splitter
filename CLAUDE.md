@@ -126,7 +126,7 @@ Implemented in `export.py` + `exiftool.py`. Notes:
 - Should also run in Docker (target: QNAP NAS); keep a `Dockerfile` working.
   `docker-compose.yml` is the QNAP Container Station application (start page on port 8000,
   volumes `/scans` read-only, `/work`, `/export`, `/config` = `$HOME` for the recent list).
-  `.github/workflows/docker.yml` pushes an amd64+arm64 image to `ghcr.io/droidgren/album-splitter`.
+  `.github/workflows/docker.yml` pushes an amd64 image to `ghcr.io/droidgren/album-splitter`.
 
 ## First milestone
 Detection + heuristic linking on `samples/`, plus a debug image per page with boxes and
