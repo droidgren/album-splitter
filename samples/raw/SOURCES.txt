@@ -1,0 +1,23 @@
+IMG_0003.png <- Karin/1/IMG_0003.png
+IMG_0007.png <- Erik/Erik-4/IMG_0007.png
+IMG_0012.tif <- Mammas o Pappas 94-96/IMG_0012.tif
+IMG_0013.tif <- Karin/Karin-3/IMG_0013.tif
+IMG_0013_2.png <- David/Album8/IMG_0013.png
+IMG_0017.png <- Anders/Album1/IMG_0017.png
+IMG_0020.png <- Anders/Album5/IMG_0020.png
+IMG_0021.png <- Erik/Erik-4/IMG_0021.png
+IMG_0025.png <- Erik/Erik-6/IMG_0025.png
+IMG_0032.tif <- Emil/Emil-9/IMG_0032.tif
+IMG_0040.png <- David/Album6/IMG_0040.png
+IMG_0041.png <- Anders/Album5/IMG_0041.png
+IMG_0051.png <- David/Album1/IMG_0051.png
+IMG_0055.png <- David/Album4/IMG_0055.png
+IMG_0057.png <- David/Album1/IMG_0057.png
+IMG_0064.tif <- Erik/Erik-7/IMG_0064.tif
+IMG_0070.tif <- Emil/Emil-5/IMG_0070.tif
+IMG_0072.tif <- Karin/Karin-7/IMG_0072.tif
+IMG_0081.tif <- Mammas o Pappas 94-96/IMG_0081.tif
+IMG_0081_2.tif <- Erik/Erik-7/IMG_0081.tif
+IMG_0087.tif <- Mammas o Pappas 91-93/IMG_0087.tif
+IMG_0096.png <- Erik/Erik-5/IMG_0096.png
+sg0063.png <- Anders/Album4/sg0063.png
