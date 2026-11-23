@@ -6,7 +6,8 @@ handwritten Swedish captions in the free space next to/below the photos).
 For each page: detect each photo, detect each handwritten text block, link text to the
 right photo, let the user review/fix quickly, then export each photo with its caption.
 
-Sample pages are in `samples/`.
+Sample pages are uncompressed 600 dpi PNG/TIFF scans, kept out of git (too large): put them in
+`samples/raw/` (ignored). `samples/raw/SOURCES.txt` lists where each one comes from.
 
 ## Architecture
 Three stages, each resumable. All state per page is stored as JSON so detection can be
@@ -140,5 +141,5 @@ Implemented in `export.py` + `exiftool.py`. Notes:
   `.github/workflows/docker.yml` pushes an amd64 image to `ghcr.io/droidgren/album-splitter`.
 
 ## First milestone
-Detection + heuristic linking on `samples/`, plus a debug image per page with boxes and
+Detection + heuristic linking on the samples, plus a debug image per page with boxes and
 links drawn, so detection quality can be judged before the review UI is built.
