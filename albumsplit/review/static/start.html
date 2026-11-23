@@ -47,6 +47,11 @@
       <label class="check"><input id="opt-claude-only" type="checkbox"> <b>Only ask Claude again</b>: no new detection;
         keeps your frames, text boxes and links <small>(Claude reads every text again and links only texts without
         a link, e.g. a box you drew; approved pages are left alone; a page Claude already read unchanged costs nothing)</small></label>
+      <label class="check"><input id="opt-guess-dates" type="checkbox"> <b>Guess dates from the album order</b>: for photos with
+        no date stamp and no dated caption <small>(only for albums scanned in order, IMG_0001 first: Claude uses the dates
+        and captions of the neighbouring pages and what the photo shows; runs when all pages are read, also after a batch;
+        guesses are marked in review)</small>
+        <button id="guess-dates" type="button" title="Guess dates now for the pages as they are (unchanged albums cost nothing)">Guess dates now</button></label>
     </div>
     <label class="check"><input id="opt-redo" type="checkbox"> Also redo pages I haven't changed or approved yet</label>
     <div class="row"><button id="detect" class="primary">Detect</button><button id="cancel" hidden>Cancel</button>

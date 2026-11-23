@@ -16,9 +16,10 @@ from PIL import Image
 from .exiftool import tag_args, write_tags
 from .imageio import load_bgr
 from .llm import quad_transform, text_crop_full
-from .model import Page, Photo, effective_caption, effective_date
+from .model import Page, Photo, date_source, effective_caption, effective_date
 
-INDEX_FIELDS = ["file", "card", "source", "page_id", "photo_id", "caption", "date"]
+# date_source: review, stamp, caption or guess (Claude, from the album order; see dates.py)
+INDEX_FIELDS = ["file", "card", "source", "page_id", "photo_id", "caption", "date", "date_source"]
 
 
 @dataclass
@@ -133,7 +134,8 @@ def export_page(page: Page, img_bgr: np.ndarray, out_dir: Path, *, cards: bool =
             jobs.append((out_dir / card_name, tags))
         rows.append({"file": name, "card": card_name, "source": page.source,
                      "page_id": page.page_id, "photo_id": photo.id,
-                     "caption": caption or "", "date": date or ""})
+                     "caption": caption or "", "date": date or "",
+                     "date_source": (date_source(page, photo) or "") if date else ""})
     if exiftool:
         write_tags(exiftool, jobs)
     for p in _stale_outputs(out_dir, page.page_id, len(photos)):

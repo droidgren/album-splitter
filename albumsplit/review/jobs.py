@@ -34,6 +34,10 @@ class DetectJob:
     # Only ask Claude again about the existing pages that are not approved: no detection, and
     # frames, boxes and links on the page stay (Claude only links texts without a link).
     claude_only: bool = False
+    # Afterwards, let Claude guess dates from the album order (`dates.py`); with `dates_only`
+    # that is all the job does.
+    guess_dates: bool = False
+    dates_only: bool = False
     page_lock: object | None = None  # the server's page-write lock, shared with review saves
     queued: int = 0           # pages whose Claude request went into a batch
     batches: list = field(default_factory=list)  # ids of the batches this job submitted
@@ -44,6 +48,7 @@ class DetectJob:
     failed: int = 0
     current: str = ""
     state: str = "starting"   # starting | running | finished | cancelled | error
+    phase: str = ""           # "dates" while the date guesses run
     error: str = ""
     started: float = field(default_factory=time.time)
     log: deque = field(default_factory=lambda: deque(maxlen=300))
@@ -75,11 +80,20 @@ class DetectJob:
             "detected": self.detected, "skipped": self.skipped, "failed": self.failed,
             "current": self.current, "error": self.error, "llm": self.llm is not None,
             "batch": self.batch, "queued": self.queued, "batches": list(self.batches),
-            "claude_only": self.claude_only,
+            "claude_only": self.claude_only, "dates_only": self.dates_only,
+            "phase": self.phase,
             "elapsed": round(time.time() - self.started, 1), "log": list(self.log)[-40:],
         }
 
     def _run(self) -> None:
+        if self.dates_only:
+            if self.llm is None:
+                raise ValueError("Guessing dates needs a Claude model")
+            self.state = "running"
+            self._guess_dates()
+            if self.state == "running":
+                self.state = "finished"
+            return
         if self.claude_only:
             if self.llm is None:
                 raise ValueError("Claude-only needs a Claude model")
@@ -112,10 +126,35 @@ class DetectJob:
                                     f"answers usually within an hour (at most 24 h).")
         self.current = ""
         if self.state == "running":
-            self.state = "finished"
             what = "read by Claude" if self.claude_only else "detected"
             self.log.append(f"Done: {self.detected} {what}, {self.skipped} skipped, "
                             f"{self.failed} failed.")
+            if self.guess_dates and self.llm is not None:
+                if self.queued:
+                    self.log.append("Dates are guessed when Claude's batch answers are in.")
+                else:
+                    self._guess_dates()
+        if self.state == "running":
+            self.state = "finished"
+
+    def _guess_dates(self) -> None:
+        """Claude guesses dates for undated photos from the album order (direct calls)."""
+        from ..dates import guess_dates
+
+        def progress(i: int, n: int) -> None:
+            self.done, self.total = i, n
+
+        self.phase, self.done, self.total = "dates", 0, 0
+        self.log.append("Guessing dates from the album order...")
+        rep = guess_dates(self.llm, self.work_dir, self.input_dir, log=self.log.append,
+                          stop=self._stop.is_set, page_lock=self.page_lock, on_progress=progress)
+        if rep.cancelled:
+            self.state = "cancelled"
+        self.failed += rep.failed
+        self.log.append(f"Dates: {rep.guessed} photos have a guessed date, {rep.undated} still "
+                        f"undated, {rep.suspects} dates out of order; {rep.pages_updated} pages "
+                        f"updated ({rep.called} Claude calls, {rep.cached} cached"
+                        + (f", {rep.failed} failed" if rep.failed else "") + ").")
 
     def _claude_all(self, pages: list[Path], queue) -> None:
         """Ask Claude about each existing page as it is now; no detection."""

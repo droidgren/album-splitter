@@ -52,6 +52,16 @@ re-run or reviewed later without losing manual edits.
   read a stamp the OCR dated, which keeps the OCR date) flags the photo with a `stamp_mismatch`
   issue. On the raw samples Opus got all 41 OCR-found stamps right; Haiku leaves more wrong dates,
   but flagged. Stamps the OCR did not find at all are not checked.
+- **Date guesses (optional, `--guess-dates`, `dates.py`)**: for albums scanned in order
+  (IMG_0001 taken first). After the page answers are in, Claude gets a text timeline per album
+  (folder of the scans, natural sort): every photo's known date (stamp with near-ties, caption,
+  reviewer) and caption, plus a 512 px image of each photo with no stamp date, no dated caption
+  and no reviewer date. It returns `photos[].date_guess` (`date` at the precision the evidence
+  allows, `confidence`, `reason`) and names known dates that break the order (issue
+  `date_out_of_order`, source `"dates"`, photo flagged). `derived_date` uses the guess last.
+  Albums are split into requests of at most 40 photos to date (plus 25 context pages each side).
+  Always direct calls (cheap), also after a batch. Cached in `llm/dates/`. Approved pages are
+  context only. `guess-dates <work_dir>` re-runs it; off for scans not in album order.
 
 Output: `<work_dir>/pages/<page_id>.json` with `photos[]`, `texts[]`, `links[]`,
 `status: "proposed" | "approved"`.
@@ -79,6 +89,10 @@ Implemented in `albumsplit/review/` (vanilla JS, no build step/CDN). Notes:
   saved with heuristic links at once, the start page polls `/api/batches` every minute and applies
   answers when a batch ends) and **Now** (direct calls). Batch results never overwrite pages that
   were approved or edited in review meanwhile; their answers stay in the `llm/` cache.
+- **Guess dates from the album order** (start page, per project: `guess_dates` in `workdir.json`):
+  runs at the end of a Now detection, or when the last batch is collected (`/api/batches/collect`
+  starts a `DetectJob(dates_only=True)`); **Guess dates now** (`POST /api/dates`) runs it alone.
+  Review marks a guessed date ("guessed", plus a chip with Claude's reason).
 - **Only ask Claude again** (`claude_only`): no detection; every page not approved, edited ones
   included, is sent as it is now. `llm.apply(keep_links=True)` keeps the links on the page and
   only links texts without one; transcriptions/dates are replaced. Uses the cache, so an
@@ -112,7 +126,8 @@ Per photo:
   as a strip underneath on a white background. Do NOT just crop a union bounding box —
   it would include parts of neighbouring photos. A caption wrapped around a print's corner
   has `texts[].outline` (its box minus the photo): blank out everything outside it.
-- One `index.csv` per run: file, source page, caption text, date.
+- One `index.csv` per run: file, source page, caption text, date, date source
+  (review / stamp / caption / guess).
 
 Implemented in `export.py` + `exiftool.py`. Notes:
 - Caption/date come from `model.effective_caption` / `effective_date`. Tags: EXIF ImageDescription,

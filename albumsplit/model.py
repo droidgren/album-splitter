@@ -33,6 +33,21 @@ class DateStamp:
 
 
 @dataclass
+class DateGuess:
+    """Date Claude guessed for a photo with no stamp and no dated caption, from the dates and
+    captions of the neighbouring pages of an album scanned in order (`dates.py`)."""
+    date: str  # YYYY, YYYY-MM or YYYY-MM-DD: only as precise as the evidence
+    reason: str = ""
+    confidence: str = "medium"  # low | medium | high
+    model: str = ""
+
+    @classmethod
+    def from_dict(cls, d: dict) -> DateGuess:
+        return cls(date=d["date"], reason=d.get("reason", ""),
+                   confidence=d.get("confidence", "medium"), model=d.get("model", ""))
+
+
+@dataclass
 class Photo:
     id: int
     corners: list[Point]  # TL, TR, BR, BL in full-resolution pixel coordinates
@@ -47,6 +62,8 @@ class Photo:
     date: str | None = None
     # Clockwise turn (0/90/180/270) applied at export, for a print mounted sideways.
     rotation: int = 0
+    # Claude's guess from the album order; used only when nothing better dates the photo.
+    date_guess: DateGuess | None = None
 
     def bbox(self) -> tuple[float, float, float, float]:
         """Axis-aligned bounding box as (x0, y0, x1, y1)."""
@@ -86,7 +103,7 @@ class Link:
 
 
 IssueKind = Literal["missed_caption", "missed_photo", "merged_photos", "bad_frame", "other",
-                    "stamp_mismatch"]
+                    "stamp_mismatch", "date_out_of_order"]
 
 
 @dataclass
@@ -131,7 +148,8 @@ class Page:
                       outline=[tuple(c) for c in p["outline"]] if p.get("outline") else None,
                       stamp=DateStamp.from_dict(p["stamp"]) if p.get("stamp") else None,
                       caption=p.get("caption"), date=p.get("date"),
-                      rotation=round(float(p.get("rotation") or 0) / 90) * 90 % 360)
+                      rotation=round(float(p.get("rotation") or 0) / 90) * 90 % 360,
+                      date_guess=DateGuess.from_dict(p["date_guess"]) if p.get("date_guess") else None)
                 for p in d.get("photos", [])
             ],
             texts=[
@@ -191,11 +209,30 @@ def derived_caption(page: Page, photo: Photo) -> str | None:
     return " ".join(parts) or None
 
 
+DateSource = Literal["review", "stamp", "caption", "guess"]
+
+
+def caption_date(page: Page, photo: Photo) -> str | None:
+    """The first date stated by a linked text."""
+    return next((t.date for t in page.linked_texts(photo.id) if t.date), None)
+
+
 def derived_date(page: Page, photo: Photo) -> str | None:
-    """Camera date stamp first, then the first dated linked text."""
+    """Camera date stamp first, then the first dated linked text, then Claude's guess."""
     if photo.stamp and photo.stamp.date:
         return photo.stamp.date
-    return next((t.date for t in page.linked_texts(photo.id) if t.date), None)
+    return caption_date(page, photo) or (photo.date_guess.date if photo.date_guess else None)
+
+
+def date_source(page: Page, photo: Photo) -> DateSource | None:
+    """Where `effective_date` comes from, or None if the photo has no date."""
+    if photo.date is not None:
+        return "review" if photo.date else None
+    if photo.stamp and photo.stamp.date:
+        return "stamp"
+    if caption_date(page, photo):
+        return "caption"
+    return "guess" if photo.date_guess else None
 
 
 def effective_caption(page: Page, photo: Photo) -> str | None:

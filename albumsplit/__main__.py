@@ -12,7 +12,8 @@ from .detect import Params
 from .imageio import find_images
 from .llm import DEFAULT_MODEL
 from .model import assign_page_ids
-from .pipeline import load_input_dir, process_page, save_input_dir
+from .pipeline import (load_guess_dates, load_input_dir, load_llm_model, process_page,
+                       save_guess_dates, save_input_dir)
 
 
 def cmd_detect(args: argparse.Namespace) -> int:
@@ -36,6 +37,11 @@ def cmd_detect(args: argparse.Namespace) -> int:
     save_input_dir(work_dir, input_dir)
     params = Params(stamps=args.stamps)
     llm = queue = None
+    if args.guess_dates and not (args.llm or args.llm_batch):
+        print("--guess-dates needs --llm or --llm-batch", file=sys.stderr)
+        return 1
+    if args.guess_dates:
+        save_guess_dates(work_dir, True)  # so llm-collect and the start page know
     if args.llm or args.llm_batch:
         llm = _make_linker(args.llm_model)
         if llm is None:
@@ -86,7 +92,35 @@ def cmd_detect(args: argparse.Namespace) -> int:
         queue.flush()
         if queue.submitted and not _wait_and_collect(llm, work_dir, queue.submitted, args.debug):
             return 1
+    if args.guess_dates and not _guess(llm, work_dir, input_dir):
+        failures += 1
     return 1 if failures else 0
+
+
+def _guess(llm, work_dir: Path, input_dir: Path, force: bool = False) -> bool:
+    from .dates import guess_dates
+    print("Guessing dates from the album order...")
+    rep = guess_dates(llm, work_dir, input_dir, force=force, log=lambda m: print("  " + m))
+    print(f"Dates: {rep.guessed} photos have a guessed date, {rep.undated} still undated, "
+          f"{rep.suspects} dates out of order; {rep.pages_updated} pages updated "
+          f"({rep.called} Claude calls, {rep.cached} cached"
+          + (f", {rep.failed} failed" if rep.failed else "") + ")")
+    return not rep.failed
+
+
+def cmd_guess_dates(args: argparse.Namespace) -> int:
+    work_dir = Path(args.work_dir).resolve()
+    if not (work_dir / "pages").is_dir():
+        print(f"No pages in {work_dir}; run detect first", file=sys.stderr)
+        return 1
+    input_dir = Path(args.input).resolve() if args.input else load_input_dir(work_dir)
+    if input_dir is None or not input_dir.is_dir():
+        print(f"Scan folder {input_dir} not found; pass --input", file=sys.stderr)
+        return 1
+    llm = _make_linker(args.llm_model or load_llm_model(work_dir) or DEFAULT_MODEL)
+    if llm is None:
+        return 1
+    return 0 if _guess(llm, work_dir, input_dir, force=args.force) else 1
 
 
 def _make_linker(model: str):
@@ -134,6 +168,11 @@ def cmd_llm_collect(args: argparse.Namespace) -> int:
     left = len(pending_batches(work_dir))
     if left:
         print(f"{left} batch(es) still running; run llm-collect again later or add --wait.")
+    elif load_guess_dates(work_dir):
+        input_dir = load_input_dir(work_dir)
+        llm = _make_linker(load_llm_model(work_dir) or pending[-1]["model"])
+        if llm is None or input_dir is None or not _guess(llm, work_dir, input_dir):
+            return 1
     return 0
 
 
@@ -226,7 +265,19 @@ def main(argv: list[str] | None = None) -> int:
                    help=f"Claude model for --llm (default: {DEFAULT_MODEL})")
     d.add_argument("--llm-batch", action="store_true",
                    help="like --llm, but through the Batch API: half price, results within 24 h")
+    d.add_argument("--guess-dates", action="store_true",
+                   help="afterwards let Claude guess dates for photos with no stamp or dated "
+                        "caption from the album order (albums scanned in order, IMG_0001 first)")
     d.set_defaults(func=cmd_detect)
+
+    g = sub.add_parser("guess-dates", help="let Claude guess dates of undated photos from the "
+                                           "album order")
+    g.add_argument("work_dir")
+    g.add_argument("--input", help="scan directory (default: the one detect used)")
+    g.add_argument("--llm-model", help="Claude model (default: the project's, else "
+                                       f"{DEFAULT_MODEL})")
+    g.add_argument("--force", action="store_true", help="ask again even where an answer is cached")
+    g.set_defaults(func=cmd_guess_dates)
 
     c = sub.add_parser("llm-collect", help="fetch finished --llm-batch results into the pages")
     c.add_argument("work_dir")

@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from pathlib import Path
 
 import cv2
@@ -227,6 +228,11 @@ class FakeLinker:
                                            transcription="Påsk\n-84", date="1984-04-22")],
                          issues=[], model=self.model, cached=False)
 
+    def _call(self, page_id, content, system, schema):  # the date-guess request
+        FakeLinker.calls.append(("dates", page_id, None))
+        return {"guesses": [{"id": 1, "date": "1984-04", "confidence": "medium",
+                             "reason": "same page as Mormor 1984-04-22"}], "suspects": []}
+
     def read_stamp(self, page, photo, img, cache_dir, *, force=False):
         from albumsplit.llm import StampAnswer
         FakeLinker.calls.append(("stamp", photo.id, force))
@@ -245,6 +251,27 @@ def test_ask_claude_about_page(env, monkeypatch):
     assert d["photos"][1]["derived_caption"] == "Påsk -84 Mormor"
     page = Page.load(page_json_path(work, "p1"))
     assert page.edited and page.linker.startswith("llm:")
+
+
+def test_guess_dates_setting_and_job(env, monkeypatch):
+    client, work, _ = env
+    monkeypatch.setattr("albumsplit.llm.LlmLinker", FakeLinker)
+    FakeLinker.calls = []
+    assert client.get("/api/project").json()["guess_dates"] is False
+    assert client.post("/api/settings", json={"guess_dates": True}).json()["guess_dates"] is True
+    r = client.post("/api/dates")
+    assert r.status_code == 200, r.text
+    for _ in range(100):
+        st = client.get("/api/detect").json()
+        if st["state"] not in ("starting", "running"):
+            break
+        time.sleep(0.05)
+    assert st["state"] == "finished" and st["dates_only"], st
+    assert [c[0] for c in FakeLinker.calls] == ["dates"]
+    d = client.get("/api/pages/p1").json()
+    p1, p2 = d["photos"]
+    assert p1["date_guess"]["date"] == "1984-04" and p1["date_source"] == "guess"
+    assert p1["derived_date"] == "1984-04" and p2["date_source"] == "caption"
 
 
 def test_ask_claude_for_stamp(env, monkeypatch):

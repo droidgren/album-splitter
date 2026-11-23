@@ -70,6 +70,7 @@ function renderProject(proj) {
     + stat(s.edited, "edited, not approved") + stat(s.needs_review, "flagged for a check", s.needs_review ? "warn" : "");
   if (s.scan_error) msg("detect-msg", s.scan_error, true);
   renderModels(proj);
+  $("opt-guess-dates").checked = !!proj.guess_dates;
   $("llm-note").textContent = proj.api_key ? ""
     : "(needs ANTHROPIC_API_KEY set before starting albumsplit, or an `ant auth login`)";
   $("llm-mode").classList.toggle("off", !$("opt-llm").checked);
@@ -101,6 +102,20 @@ function renderModels(proj) {
 async function setModel() {
   try {
     renderProject(await post("/api/settings", { llm_model: $("llm-model").value }));
+  } catch (e) { msg("detect-msg", e.message, true); }
+}
+
+async function setGuessDates() {
+  try {
+    renderProject(await post("/api/settings", { guess_dates: $("opt-guess-dates").checked }));
+  } catch (e) { msg("detect-msg", e.message, true); }
+}
+
+async function guessDatesNow() {
+  msg("detect-msg", "");
+  try {
+    renderProject(await post("/api/dates"));
+    poll();
   } catch (e) { msg("detect-msg", e.message, true); }
 }
 
@@ -138,6 +153,7 @@ function syncOptions() {
   $("opt-redo").disabled = claudeOnly();
   $("opt-redo").parentElement.classList.toggle("muted", claudeOnly());
   $("redetect-all").disabled = detectRunning || claudeOnly();
+  $("guess-dates").disabled = detectRunning;
 }
 
 // ---------- detection ----------
@@ -176,8 +192,11 @@ async function poll() {
   syncOptions();
   $("cancel").hidden = !running;
   $("bar-fill").style.width = st.total ? `${(100 * st.done) / st.total}%` : "0";
-  const eta = st.done && running ? Math.round((st.elapsed / st.done) * (st.total - st.done)) : 0;
-  $("progress-text").textContent = `${st.done} / ${st.total}: ${st.detected} `
+  const eta = st.done && running && st.phase !== "dates" ? Math.round((st.elapsed / st.done) * (st.total - st.done)) : 0;
+  if (st.phase === "dates") {
+    $("progress-text").textContent = `Guessing dates: ${st.done} / ${st.total} parts of the albums`
+      + (running ? "" : ` · ${st.state}`) + (st.error ? ` · ${st.error}` : "");
+  } else $("progress-text").textContent = `${st.done} / ${st.total}: ${st.detected} `
     + `${st.claude_only ? "read by Claude" : "detected"}, ${st.skipped} skipped`
     + (st.failed ? `, ${st.failed} failed` : "") + (st.queued ? `, ${st.queued} queued for Claude` : "")
     + (st.current && running ? ` · ${st.current}` : "")
@@ -249,6 +268,7 @@ async function collectBatches() {
       log.scrollTop = log.scrollHeight;
     }
     renderProject(r.project);
+    if (r.dates) poll();  // the date guesses started now that every answer is in
     if (r.pending.batches) schedulePollBatches(BATCH_POLL_MS);
     else renderBatches([]);
   } catch (e) {
@@ -365,6 +385,8 @@ for (const id of ["opt-llm", "opt-claude-only"]) {
   $(id).addEventListener("change", () => { syncOptions(); if (stats) updateDetectButton(stats); });
 }
 $("llm-model").addEventListener("change", setModel);
+$("opt-guess-dates").addEventListener("change", setGuessDates);
+$("guess-dates").addEventListener("click", (e) => { e.preventDefault(); guessDatesNow(); });
 $("batch-check").addEventListener("click", () => { msg("batch-msg", "Checking…"); pollBatches().then(() => {
   if ($("batch-msg").textContent === "Checking…") msg("batch-msg", ""); }); });
 $("review").addEventListener("click", () => { location.href = "/review"; });

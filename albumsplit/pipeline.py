@@ -51,7 +51,7 @@ def _load_config(work_dir: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _update_config(work_dir: Path, **values: str) -> None:
+def _update_config(work_dir: Path, **values: object) -> None:
     path = workdir_config_path(work_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -87,6 +87,18 @@ def load_llm_model(work_dir: Path) -> str | None:
         return _load_config(work_dir).get("llm_model") or None
     except (OSError, ValueError):
         return None
+
+
+def save_guess_dates(work_dir: Path, on: bool) -> None:
+    """Remember whether Claude should guess dates from the album order (`dates.py`)."""
+    _update_config(work_dir, guess_dates=bool(on))
+
+
+def load_guess_dates(work_dir: Path) -> bool:
+    try:
+        return bool(_load_config(work_dir).get("guess_dates"))
+    except (OSError, ValueError):
+        return False
 
 
 def load_export_dir(work_dir: Path) -> Path | None:

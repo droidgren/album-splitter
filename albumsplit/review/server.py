@@ -22,9 +22,10 @@ from fastapi.staticfiles import StaticFiles
 
 from ..imageio import IMAGE_EXTS, downscale, find_images, load_bgr
 from ..llm import DEFAULT_MODEL, MODELS
-from ..model import Page, assign_page_ids, derived_caption, derived_date
-from ..pipeline import (load_export_dir, load_input_dir, load_llm_model, page_json_path,
-                        save_export_dir, save_input_dir, save_llm_model)
+from ..model import Page, assign_page_ids, date_source, derived_caption, derived_date
+from ..pipeline import (load_export_dir, load_guess_dates, load_input_dir, load_llm_model,
+                        page_json_path, save_export_dir, save_guess_dates, save_input_dir,
+                        save_llm_model)
 from .geometry import normalize
 from .jobs import DetectJob, ExportJob
 
@@ -172,13 +173,14 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
                     d.update(label=label, note=note)
         out = {"work_dir": None, "input_dir": None, "stats": None,
                "detect": job.status() if job else None, "llm_model": current_model(),
-               "llm_models": models, "pending": None,
+               "llm_models": models, "pending": None, "guess_dates": False,
                "export": ex.status() if ex else None, "export_dir": None,
                "exiftool": exiftool_info(),
                "api_key": bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"))}
         if st["work"] is not None and st["input"] is not None:
             out.update(work_dir=str(st["work"]), input_dir=str(st["input"]),
                        stats=stats(st["work"], st["input"]), pending=pending_info(st["work"]),
+                       guess_dates=load_guess_dates(st["work"]),
                        export_dir=str(load_export_dir(st["work"]) or st["work"] / "export"))
         return out
 
@@ -260,6 +262,8 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
             if model not in model_ids:
                 raise HTTPException(422, f"Unknown model {model!r}")
             save_llm_model(work, model)
+        if "guess_dates" in body:
+            save_guess_dates(work, bool(body["guess_dates"]))
         return project_info()
 
     @app.post("/api/detect")
@@ -272,8 +276,23 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
         st["job"] = DetectJob(input_dir=inp, work_dir=work, redo=bool(body.get("redo")),
                               force=bool(body.get("force")) and not claude_only, llm=llm,
                               batch=bool(use_llm and body.get("batch")),
-                              claude_only=claude_only, page_lock=lock)
+                              claude_only=claude_only, page_lock=lock,
+                              guess_dates=use_llm and load_guess_dates(work))
         st["job"].start()
+        return project_info()
+
+    def start_dates() -> None:
+        work, inp = project()
+        st["job"] = DetectJob(input_dir=inp, work_dir=work, llm=linker(), dates_only=True,
+                              page_lock=lock)
+        st["job"].start()
+
+    @app.post("/api/dates")
+    def guess_dates_now() -> dict:
+        """Let Claude guess dates for the undated photos from the album order."""
+        project()
+        busy()
+        start_dates()
         return project_info()
 
     # ---------- Claude batches ----------
@@ -307,7 +326,13 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
         for model in sorted({b["model"] for b in pending_batches(work)}):
             u, k = collect(linker(model), work, debug=True, log=log.append)
             updated, kept = updated + u, kept + k
-        return {"updated": updated, "not_updated": kept, "log": log,
+        dates = False
+        ex = st["export"]
+        if (updated and load_guess_dates(work) and not pending_batches(work)
+                and not (ex is not None and ex.running)):
+            start_dates()  # all page answers are in: now the album order can be used
+            dates = True
+        return {"updated": updated, "not_updated": kept, "log": log, "dates": dates,
                 "pending": pending_info(work), "project": project_info()}
 
     @app.get("/api/detect")
@@ -397,6 +422,7 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
         for pd, ph in zip(d["photos"], page.photos):
             pd["derived_caption"] = derived_caption(page, ph)
             pd["derived_date"] = derived_date(page, ph)
+            pd["date_source"] = date_source(page, ph)
         d.update(extra)
         return d
 

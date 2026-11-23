@@ -767,7 +767,7 @@ function renderPanel() {
     panel.append(el("h3", {}, "Issues"));
     pg.issues.forEach((iss, i) => panel.append(el("div", { class: "issue" },
       el("button", { title: "Dismiss", onclick: () => mutate(() => pg.issues.splice(i, 1)) }, "×"),
-      el("b", {}, iss.kind.replace("_", " ")),
+      el("b", {}, iss.kind.replaceAll("_", " ")),
       iss.photo_ids.length ? ` (photo ${iss.photo_ids.join(", ")})` : "", iss.note ? ": " + iss.note : "")));
   }
 
@@ -787,7 +787,9 @@ function renderPanel() {
       el("label", {}, "Caption"),
       overrideField({ key: `cap${p.id}`, multiline: true, value: p.caption, derived: p.derived_caption,
         placeholder: "no caption", onSet: (v, now) => setPhotoField(p.id, "caption", v, now) }),
-      el("label", {}, "Date (YYYY, YYYY-MM or YYYY-MM-DD)"),
+      el("label", {}, "Date (YYYY, YYYY-MM or YYYY-MM-DD)",
+        p.date == null && p.date_source === "guess"
+          ? el("span", { class: "guessed", title: "No stamp or dated caption: Claude guessed it from the album order" }, " guessed") : null),
       overrideField({ key: `date${p.id}`, value: p.date, derived: p.derived_date, placeholder: "unknown", pattern: DATE_RE,
         onSet: (v, now) => setPhotoField(p.id, "date", v, now) }));
     const stampBtn = el("button", { class: "ask", disabled: S.busy, title: "Ask Claude to read the date the camera printed into this photo",
@@ -802,6 +804,12 @@ function renderPanel() {
         st.date ? null : el("span", { class: "muted" }, "unread "), stampBtn));
     } else {
       card.append(el("div", { class: "chips" }, el("span", { class: "muted" }, "No date stamp found "), stampBtn));
+    }
+    if (p.date_guess) {
+      const g = p.date_guess, cur = p.date ?? p.derived_date;
+      card.append(el("div", { class: "chips", title: g.reason || "" }, `Guess from the album order (${g.confidence}): `,
+        el("span", { class: "chip" + (g.date === cur ? " on" : ""), title: "Use this date", onclick: () => setPhotoField(p.id, "date", g.date, true) }, g.date),
+        g.reason ? el("div", { class: "muted reason" }, g.reason) : null));
     }
     panel.append(card);
   }
