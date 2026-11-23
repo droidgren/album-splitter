@@ -39,6 +39,12 @@ re-run or reviewed later without losing manual edits.
   readings of a line vote on the date (`_vote`), italic digits are deslanted per line (`_slant`),
   a stricter threshold is tried only if nothing was found (`mask_levels`), and a date that needs
   a digit unreadable on its own (`max_digit_cost`) stays undated. Misreads are worse than misses.
+  The "dotted" LED style (every segment a short separate bar with a wide red glow; Album8 and some
+  old samples) is read by `_read_dotted`: bars are found from the lightness they add (top-hat),
+  laid out into digit cells, and each segment measured where its bar must be. Per line, the kind
+  (dotted or not) whose readings fit better votes (`Candidate.base`, without the date bonus). A
+  dotted reading with a bar no cell explains, or a gap with room for a lost digit (padding only
+  sits before a one-digit field), stays undated.
 - **Linking (heuristic baseline)**: each text block → photo with the smallest edge-to-edge
   distance, preferring horizontal adjacency. Allow many-to-many links.
 - **Linking (optional, `--llm`)**: send the downscaled page plus numbered boxes overlaid to

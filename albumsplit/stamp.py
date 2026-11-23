@@ -20,10 +20,15 @@ background that makes them saturated orange (grass, water) or only faintly pink 
    and settled against the other stamps of the page (`harmonize`).
 
 Segment-like noise in textured photos rarely forms a line that reads as a valid date.
+
+Some cameras (Album8, 1999-2009) expose every segment as a short separate bar with a wide red
+glow: the "dotted" style. Each found line is also read that way (`_read_dotted`, from the
+lightness the bars add), and the kind of reading that explains the line better decides.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import itertools
 from dataclasses import dataclass, field
@@ -71,6 +76,10 @@ class StampParams:
     # probably missed (too faint), so the date read without it is not trusted. Field gaps on
     # the samples reach 1.8 (a one-digit day padded to two cells).
     max_gap: float = 2.1
+    dotted: bool = True          # also read each line as the dotted style (see _read_dotted)
+    # Dotted readings measure each segment where its bar must be, so a right digit fits well:
+    # one that fits worse than this is too faint or hidden to trust.
+    dotted_max_digit_cost: float = 1.2
 
 
 # Seven-segment patterns, segments "abcdefg" (a top, b upper right, c lower right, d bottom,
@@ -119,6 +128,8 @@ class Candidate:
     contrast: float
     regrouped: bool = False               # fields only came out right after joining two
     slant: float = 0.0                    # italic shear of the digits (x per y)
+    dotted: bool = False                  # read by _read_dotted (one dash per segment)
+    base: float = 0.0                     # the score without the valid-date factor (_score)
     score: float = 0.0
     text: str = ""
     fields: list[str] = field(default_factory=list)
@@ -152,7 +163,8 @@ def find_stamp(img_bgr: np.ndarray, corners: list[Point], outline: list[Point] |
     else:
         return None
     for c in cands:
-        if c.date and (_mean_cost(c) > sp.max_mean_cost or _worst_cost(c) > sp.max_digit_cost):
+        worst = sp.dotted_max_digit_cost if c.dotted else sp.max_digit_cost
+        if c.date and (_mean_cost(c) > sp.max_mean_cost or _worst_cost(c) > worst):
             # A stamp, but the digits are too damaged to trust the date: leave it for review.
             c.date_alts = [c.date] + c.date_alts
             c.date = None
@@ -178,9 +190,20 @@ def _vote(best: Candidate, cands: list[Candidate]) -> Candidate:
         return (ox > 0.5 * min(c.box[2] - c.box[0], best.box[2] - best.box[0])
                 and oy > 0.5 * min(c.box[3] - c.box[1], best.box[3] - best.box[1]))
 
+    # Dotted-style readings (see _read_dotted) and the others see different pictures of the
+    # same digits: only the kind that reads the line better in total votes.
+    # (Judged without the bonus for a valid date: a dotted reading that leaves a stamp
+    # undated because a digit is missing must not hand the line to the other kind's misread.)
+    kinds: dict[bool, float] = {}
+    for c in cands:
+        if same_line(c):
+            kinds[c.dotted] = kinds.get(c.dotted, 0.0) + c.base
+    kind = max(kinds, key=lambda k: kinds[k]) if kinds else best.dotted
+    if kind != best.dotted:
+        best = max((c for c in cands if same_line(c) and c.dotted == kind), key=lambda c: c.score)
     votes: dict[str | None, float] = {}
     for c in cands:
-        if same_line(c) and c.score > 0:
+        if same_line(c) and c.dotted == kind and c.score > 0:
             votes[c.date] = votes.get(c.date, 0.0) + c.score
     if not votes:
         return best
@@ -195,7 +218,8 @@ def _vote(best: Candidate, cands: list[Candidate]) -> Candidate:
 
 def _worst_cost(c: Candidate) -> float:
     """How badly the worst of the chosen digits (ones aside) explains its glyph."""
-    costs = [g.costs.get(g.char, 3.0) for g in c.glyphs if g.kind == "digit" and g.char != "1"]
+    costs = [g.costs.get(g.char, 3.0) for g in c.glyphs
+             if g.kind == "digit" and (g.char != "1" or c.dotted)]
     return float(max(costs)) if costs else 3.0
 
 
@@ -203,9 +227,11 @@ def _mean_cost(c: Candidate) -> float:
     """How badly the chosen digits explain their glyphs, on average (0 = perfectly).
 
     Ones are left out: a single bar fits almost any narrow blob, so it says nothing about how
-    trustworthy the reading of the other digits is.
+    trustworthy the reading of the other digits is. (A dotted reading measures a "1" at its
+    cell's bar positions like any other digit: there it counts.)
     """
-    costs = [g.costs.get(g.char, 3.0) for g in c.glyphs if g.kind == "digit" and g.char != "1"]
+    costs = [g.costs.get(g.char, 3.0) for g in c.glyphs
+             if g.kind == "digit" and (g.char != "1" or c.dotted)]
     return float(np.mean(costs)) if costs else 3.0
 
 
@@ -402,7 +428,10 @@ def candidates(crop: np.ndarray, valid: np.ndarray, sp: StampParams, level: floa
     short = min(ch, cw)
     band = max(8, int(sp.band * short))
     y_off = ch - band
-    warm, reddish = warmth(cv2.GaussianBlur(crop, (0, 0), blur) if blur > 0 else crop, sp)
+    src = cv2.GaussianBlur(crop, (0, 0), blur) if blur > 0 else crop
+    warm, reddish = warmth(src, sp)
+    light = (cv2.cvtColor(src, cv2.COLOR_BGR2LAB)[..., 0].astype(np.float32) * (100 / 255)
+             if sp.dotted else None)
     out: list[Candidate] = []
     for frac in sp.digit_h:
         h = frac * short
@@ -415,6 +444,7 @@ def candidates(crop: np.ndarray, valid: np.ndarray, sp: StampParams, level: floa
                 warm_contrast(np.ascontiguousarray(w_[y_off - pad:]), r_[y_off - pad:], k)[pad:])
             vb = np.ascontiguousarray(v_[y_off:])
             wb, rb = w_[y_off:], r_[y_off:]
+            lb = None if light is None else (np.rot90(light, 2) if flipped else light)[y_off:]
             mask, lo = stamp_mask(db, vb, sp, level)
             if not mask.any():
                 continue
@@ -429,9 +459,16 @@ def candidates(crop: np.ndarray, valid: np.ndarray, sp: StampParams, level: floa
                     r.score = _score(r, cw, sp)
                     if r.score > best.score:
                         best = r
-                best.flipped = flipped
-                best.box = (best.box[0], best.box[1] + y_off, best.box[2], best.box[3] + y_off)
-                out.append(best)
+                found = [best]
+                if lb is not None:
+                    dot = _read_dotted(c, wb, rb, lb, sp)
+                    if dot is not None:
+                        dot.score = _score(dot, cw, sp)
+                        found.append(dot)
+                for b in found:
+                    b.flipped = flipped
+                    b.box = (b.box[0], b.box[1] + y_off, b.box[2], b.box[3] + y_off)
+                    out.append(b)
     return out
 
 
@@ -694,6 +731,247 @@ def ellipse(k: int) -> np.ndarray:
     return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
 
 
+# --------------------------------------------------------------------------- dotted style
+
+@dataclass
+class _Dash:
+    x: float          # centre (px in the dash map)
+    y: float
+    w: int
+    h: int
+    strength: float   # peak of the dash map (L* units)
+    kind: str         # "V" vertical, "H" horizontal, "D" round
+
+
+def _column_background(f: np.ndarray, x0: int, x1: int, y0: int, y1: int, h: float
+                       ) -> np.ndarray | None:
+    """Per-column background of f for columns x0..x1: the median of the rows just above and
+    below the line y0..y1 (they hold no stamp), smoothed across columns."""
+    above = f[max(0, int(y0 - 1.0 * h)):max(0, int(y0 - 0.25 * h)), x0:x1]
+    below = f[min(f.shape[0], int(y1 + 0.25 * h)):min(f.shape[0], int(y1 + 1.0 * h)), x0:x1]
+    ring = np.concatenate([above, below], axis=0)
+    if ring.shape[0] < 3 or ring.shape[1] == 0:
+        return None
+    bg = np.median(ring, axis=0).astype(np.float32)
+    k = max(3, int(0.5 * h)) | 1
+    return cv2.blur(bg[None, :], (k, 1), borderType=cv2.BORDER_REPLICATE)[0]
+
+
+def _dash_map(c: Candidate, warm: np.ndarray, reddish: np.ndarray, light: np.ndarray
+              ) -> tuple[np.ndarray, int, int] | None:
+    """Lightness gained over the background where the pixel is also warmer than its
+    background, with the wide glow removed (top-hat): the LED bars around a line.
+    Returns (map, x offset, y offset)."""
+    h = c.digit_h
+    x0, y0, x1, y1 = c.box
+    # (Reach past the line's ends: a digit the glyph grouping lost may sit there.)
+    rx0, rx1 = max(0, int(x0 - 3.0 * h)), min(warm.shape[1], int(x1 + 3.0 * h))
+    ry0, ry1 = max(0, int(y0 - 0.4 * h)), min(warm.shape[0], int(y1 + 0.4 * h))
+    bl = _column_background(light, rx0, rx1, y0, y1, h)
+    bw = _column_background(warm, rx0, rx1, y0, y1, h)
+    if bl is None or bw is None or ry1 - ry0 < 4:
+        return None
+    gain = light[ry0:ry1, rx0:rx1] - bl[None, :]
+    hot = (warm[ry0:ry1, rx0:rx1] > bw[None, :]) & reddish[ry0:ry1, rx0:rx1]
+    core = cv2.GaussianBlur(np.where(hot, np.clip(gain, 0, None), 0).astype(np.float32), (0, 0),
+                            max(0.6, 0.03 * h))
+    # Each bar's glow is wider than the bar itself.
+    core = cv2.morphologyEx(core, cv2.MORPH_TOPHAT, ellipse(max(3, int(round(0.2 * h)))))
+    return core, rx0, ry0
+
+
+def _find_dashes(core: np.ndarray, c: Candidate, ox: int, oy: int) -> list[_Dash]:
+    """Bar-shaped blobs of the dash map (coordinates in the map)."""
+    h = c.digit_h
+    x0, y0, x1, y1 = c.box
+    inner = core[max(0, y0 - oy):y1 - oy, max(0, x0 - ox):x1 - ox]
+    if inner.size == 0:
+        return []
+    peak = float(np.percentile(inner, 99))
+    if peak < 3.0:  # (L* units: nothing stands out)
+        return []
+    n, labels, stats, cents = cv2.connectedComponentsWithStats(
+        (core > 0.4 * peak).astype(np.uint8), connectivity=8)
+    out = []
+    for i in range(1, n):
+        x, y, w, hh, area = (int(v) for v in stats[i])
+        long, short = max(w, hh), min(w, hh)
+        if not (0.15 * h <= long <= 0.55 * h and short <= 0.3 * h and area >= 0.012 * h * h):
+            continue
+        kind = "V" if hh >= 1.3 * w else ("H" if w >= 1.3 * hh else "D")
+        strength = float(core[y:y + hh, x:x + w][labels[y:y + hh, x:x + w] == i].max())
+        out.append(_Dash(float(cents[i][0]), float(cents[i][1]), w, hh, strength, kind))
+    return out
+
+
+def _read_dotted(c: Candidate, warm: np.ndarray, reddish: np.ndarray, light: np.ndarray,
+                 sp: StampParams) -> Candidate | None:
+    """Read a line in the dotted LED style: every segment is a short separate bar.
+
+    Some cameras expose each segment as a short bar with a wide red glow. The bars burn
+    yellow-white, so the warmth peaks in a ring around each one; the glow of six bars fills
+    the middle of a 0 until the segment reading sees an 8, and the glyph grouping cuts digits
+    at the gaps between their bars. Here the bars are found from the lightness they add, and
+    they lay out the digit cells: horizontal bars mark the middle of their cell, vertical bars
+    sit half a cell width left and right of it, a column of vertical bars alone is a "1" and
+    a single high bar just before a digit is the apostrophe. Each cell's seven segments are
+    then measured where their bars must be.
+    """
+    found = _dash_map(c, warm, reddish, light)
+    if found is None:
+        return None
+    core, ox, oy = found
+    dashes = _find_dashes(core, c, ox, oy)
+    vert = [d for d in dashes if d.kind != "H"]
+    if len(dashes) < 5 or len(vert) < 3:
+        return None
+    # Vertical frame from the vertical bars: an upper and a lower row.
+    ys = sorted(d.y for d in vert)
+    split = max(range(1, len(ys)), key=lambda i: ys[i] - ys[i - 1])
+    upper, lower = ys[:split], ys[split:]
+    gap = _median(lower) - _median(upper)
+    if not 0.25 * c.digit_h <= gap <= 0.6 * c.digit_h:
+        return None
+    mid = (_median(upper) + _median(lower)) / 2
+    D = 2 * gap  # digit height (the bars' centres sit at a quarter and three quarters)
+    # Italic slant: an upper bar sits right of the lower bar of its column.
+    shifts = []
+    for u in (d for d in vert if d.y < mid):
+        below = [d for d in vert if d.y > mid and abs(d.x - u.x) < 0.3 * D]
+        if below:
+            lw = min(below, key=lambda d: abs(d.x - u.x))
+            shifts.append((u.x - lw.x) / max(1.0, lw.y - u.y))
+    slant = float(np.clip(_median(shifts), 0.0, 0.35)) if shifts else 0.0
+    rows: dict[int, str] = {}
+    for d in dashes:
+        d.x += slant * (d.y - mid)  # upright
+        dy = (d.y - mid) / D
+        if d.kind == "H":
+            row = ("a" if -0.65 < dy < -0.3 else "g" if abs(dy) < 0.15 else
+                   "d" if 0.3 < dy < 0.65 else "")
+        else:  # ("t": too high for a segment, maybe the apostrophe)
+            row = ("t" if -0.7 < dy <= -0.4 else "u" if -0.4 < dy < -0.05 else
+                   "l" if 0.05 < dy < 0.45 else "")
+        if row:
+            rows[id(d)] = row
+    hor = sorted((d for d in dashes if rows.get(id(d), "") in ("a", "g", "d")), key=lambda d: d.x)
+    vert = sorted((d for d in dashes if rows.get(id(d), "") in ("u", "l")), key=lambda d: d.x)
+    if not hor or len(vert) < 2:
+        return None
+    # Half the cell width: from a horizontal bar to the nearest vertical bar on its right
+    # (every digit with a horizontal bar has a right column).
+    right = [min((v.x - d.x for v in vert if 0.1 * D < v.x - d.x < 0.6 * D), default=None)
+             for d in hor]
+    right = [r for r in right if r is not None]
+    if not right:
+        return None
+    half = _median(right)
+    row_y = {r: _median([d.y for d in dashes if rows.get(id(d)) == r]) for r in "aguld"
+             if any(rows.get(id(d)) == r for d in dashes)}
+    row_y.setdefault("a", mid - 0.47 * D)
+    row_y.setdefault("d", mid + 0.47 * D)
+    row_y.setdefault("g", mid)
+    row_y.setdefault("u", mid - 0.25 * D)
+    row_y.setdefault("l", mid + 0.25 * D)
+    # Cell centres: horizontal bars, then columns of vertical bars no cell explains.
+    groups: list[list[float]] = []
+    for d in hor:  # (cells are more than two half widths apart)
+        if groups and d.x - groups[-1][0] < 1.0 * half:
+            groups[-1].append(d.x)
+        else:
+            groups.append([d.x])
+    centres = [float(np.mean(g)) for g in groups]
+    def near(x: float) -> bool:
+        return any(abs(x - cx) < 0.4 * half for cx in centres)
+
+    spare = [v for v in vert if not (near(v.x - half) or near(v.x + half))]
+    ticks = [d for d in dashes if rows.get(id(d)) == "t"]
+    cols: list[list[_Dash]] = []
+    for v in spare:
+        if cols and v.x - cols[-1][-1].x < 0.35 * half:
+            cols[-1].append(v)
+        else:
+            cols.append([v])
+    for col in cols:
+        x = float(np.mean([v.x for v in col]))
+        before_digit = any(0 < cx - half - x < 1.6 * half for cx in centres)
+        kinds = {rows[id(v)] for v in col}
+        if len(col) == 1 and kinds == {"u"} and before_digit:
+            ticks.append(col[0])
+        elif kinds == {"u", "l"} and all(abs(x - half - cx) > 1.2 * half for cx in centres):
+            centres.append(x - half)  # a "1" (its right column)
+    centres.sort()
+    ticks = [t for t in ticks if any(0 < cx - half - t.x < 1.6 * half for cx in centres)]
+    if len(centres) < 3:
+        return None
+    # Measure every segment where its bar must be (the map is slanted: shear back).
+    strengths = sorted(d.strength for d in dashes if id(d) in rows and rows[id(d)] != "t")
+    ref = _median(strengths) if strengths else 1.0
+    slots = {"a": (0, "a"), "g": (0, "g"), "d": (0, "d"), "f": (-1, "u"), "e": (-1, "l"),
+             "b": (1, "u"), "c": (1, "l")}
+
+    def level(x: float, y: float, rx: float, ry: float) -> float:
+        xs = x - slant * (y - mid)
+        z = core[max(0, int(y - ry)):max(0, int(np.ceil(y + ry))),
+                 max(0, int(xs - rx)):max(0, int(np.ceil(xs + rx)))]
+        return min(1.0, float(z.max()) / ref) if z.size else 0.0
+
+    # The joints between the bars are dark in every digit of this style: their typical level
+    # is the floor (what is left of glow and background in the dash map).
+    floor = _median([level(cx + side * half, row_y[row], 0.15 * half, 0.05 * D)
+                     for cx in centres for side in (-1, 1) for row in "agd"])
+    floor = min(floor, 0.5)
+    pad = 0.08 * D
+    glyphs: list[_Glyph] = []
+    for cx in centres:
+        lv = {}
+        for seg, (side, row) in slots.items():
+            if side == 0:
+                v = level(cx, row_y[row], 0.5 * half, 0.1 * D)
+            else:
+                v = level(cx + side * half, row_y[row], 0.35 * half, 0.12 * D)
+            lv[seg] = float(np.clip((v - floor) / (1 - floor), 0, 1))
+        cost: dict[str, float] = {}
+        for pattern, ch in _SEGMENTS.items():
+            v = sum(1 - lv[k] if k in pattern else lv[k] for k in "abcdefg")
+            cost[ch] = min(cost.get(ch, 99.0), v)
+        g = _Glyph(int(round(cx - half - pad + ox)), int(round(mid - 0.5 * D - pad + oy)),
+                   int(round(cx + half + pad + ox)), int(round(mid + 0.5 * D + pad + oy)),
+                   "digit")
+        g.costs = cost
+        glyphs.append(g)
+    for t in ticks:
+        glyphs.append(_Glyph(int(round(t.x - t.w / 2 + ox)), int(round(t.y - t.h / 2 + oy)),
+                             int(round(t.x + t.w / 2 + ox)), int(round(t.y + t.h / 2 + oy)),
+                             "tick"))
+    glyphs.sort(key=lambda g: g.x0)
+    box = (min(g.x0 for g in glyphs), min(g.y0 for g in glyphs),
+           max(g.x1 for g in glyphs), max(g.y1 for g in glyphs))
+    out = dataclasses.replace(c, glyphs=glyphs, digit_h=float(D + 2 * pad), box=box, slant=slant,
+                              dotted=True, regrouped=False, fields=[], date_alts=[], date=None,
+                              text="", year_field=None, score=0.0)
+    _read(out, sp)
+    # A bar beside the line that belongs to no cell: a digit there was too faint to make out
+    # (a "1" with one bar, a 9 with two), and the date read without it is off by a digit.
+    tick_ids = {id(t) for t in ticks}
+    gaps = [b - a for a, b in zip(centres, centres[1:]) if b - a < 4.5 * half]
+    pitch = _median(gaps) if gaps else 3.8 * half
+    reach = pitch + 1.6 * half
+    lost = any(rows.get(id(d), "t") != "t" and id(d) not in tick_ids and d.strength >= 0.5 * ref
+               and all(abs(d.x - cx) > 1.5 * half for cx in centres)
+               and centres[0] - reach < d.x < centres[-1] + reach for d in dashes)
+    # Digits of a field are one pitch apart, fields about 1.4, and 2.4 before a one-digit
+    # field (it keeps its empty first cell). Wider still, or that wide before two digits: a
+    # digit in between was not seen at all.
+    steps = [b - a for a, b in zip(centres, centres[1:])] + [99 * pitch]
+    lost = lost or any(step > 2.8 * pitch or (step > 1.9 * pitch and steps[i + 1] < 1.25 * pitch)
+                       for i, step in enumerate(steps[:-1]))
+    if lost and out.date:
+        out.date_alts = [out.date] + out.date_alts
+        out.date = None
+    return out
+
+
 # --------------------------------------------------------------------------- reading
 
 def segment_levels(patch: np.ndarray) -> dict[str, float]:
@@ -803,12 +1081,16 @@ def _read(c: Candidate, sp: StampParams) -> None:
     """
     # A "1" is one bar where other digits are a box: a glyph much narrower than the line's
     # other digits is read as a 1 even when glow makes it wider than a bare stroke.
-    one_w = 0.62 * _digit_width(c)
-    digits = [g for g in c.glyphs if g.kind == "digit"]
-    c.slant = _slant(c, sp)
-    for g in digits:
-        g.costs = _digit_costs(g.patch, c.digit_h, narrow=g.x1 - g.x0 < one_w, slant=c.slant)
-        g.char = _best_char(g.costs)
+    if not c.dotted:  # (dotted readings come with their costs)
+        one_w = 0.62 * _digit_width(c)
+        c.slant = _slant(c, sp)
+        for g in c.glyphs:
+            if g.kind == "digit":
+                g.costs = _digit_costs(g.patch, c.digit_h, narrow=g.x1 - g.x0 < one_w,
+                                       slant=c.slant)
+    for g in c.glyphs:
+        if g.kind == "digit":
+            g.char = _best_char(g.costs)
     for use_ticks in (True, False):
         groups, year_field = _fields(c, use_ticks)
         found = _best_date(groups, year_field, sp)
@@ -970,6 +1252,7 @@ def _best_date(groups: list[list[_Glyph]], year_field: int | None, sp: StampPara
 def _score(c: Candidate, cw: int, sp: StampParams) -> float:
     """How stamp-like a read line is: enough well-fitting, evenly sized digits with clear warm
     contrast near the expected corner, and most of all, a valid date."""
+    c.base = 0.0
     digits = [g for g in c.glyphs if g.kind == "digit"]
     read = sum(g.char != "?" for g in digits)
     if read < sp.min_digits or len(digits) > 8:
@@ -985,4 +1268,5 @@ def _score(c: Candidate, cw: int, sp: StampParams) -> float:
     pos = 0.5 + 0.5 * float(np.clip((cx - 0.3) / 0.4, 0, 1))
     # (A date that needed two fields joined is weaker evidence than one the gaps gave.)
     shape = (1.0 if c.regrouped else 1.5) if c.date else (0.6 if len(c.fields) == 3 else 0.4)
-    return fit * min(read, 6) / 3 * min(c.contrast, 3.0) * regular * pos * shape
+    c.base = fit * min(read, 6) / 3 * min(c.contrast, 3.0) * regular * pos
+    return c.base * shape

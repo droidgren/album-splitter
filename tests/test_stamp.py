@@ -185,6 +185,76 @@ def test_ones_are_narrow_and_stay_in_their_field(text, date):
 
 
 
+def add_dotted_stamp(img: np.ndarray, text: str, h: int = H) -> None:
+    """Burn a stamp in the dotted LED style into the bottom right: every segment a short bar
+    with a yellow-white core and a wide red glow (the glow of a 0's six bars fills its middle).
+    "_" is a digit cell left dark."""
+    w, cell = int(0.55 * h), int(0.95 * h)  # (as measured on Album8)
+    bar, thick = 0.14 * h, max(2, int(0.11 * h))
+    centres = {"a": (0.5, 0.0, "h"), "b": (1.0, 0.25, "v"), "c": (1.0, 0.75, "v"),
+               "d": (0.5, 1.0, "h"), "e": (0.0, 0.75, "v"), "f": (0.0, 0.25, "v"),
+               "g": (0.5, 0.5, "h")}
+    width = len(text) * cell + 2 * h
+    core = np.zeros((2 * h, width), np.float32)
+    x = h // 2
+    for ch in text:
+        if ch == " ":
+            x += int(0.45 * h)
+            continue
+        if ch == "_":  # a digit too faint to see
+            x += cell
+            continue
+        if ch == "'":
+            cx, cy = x, h // 2 - int(0.05 * h)
+            cv2.line(core, (cx, int(cy - bar)), (cx, int(cy + bar * 0.6)), 1.0, thick)
+            x += int(0.35 * h)
+            continue
+        for seg in _DIGITS[ch]:
+            fx, fy, o = centres[seg]
+            cx, cy = x + fx * w, h // 2 + fy * h
+            d = (bar, 0) if o == "h" else (0, bar)
+            cv2.line(core, (int(cx - d[0]), int(cy - d[1])), (int(cx + d[0]), int(cy + d[1])),
+                     1.0, thick)
+        x += cell
+    core = core[:, :x + h // 2]
+    glow = np.clip(cv2.GaussianBlur(core, (0, 0), 0.12 * h) * 2.2, 0, 1)
+    core = cv2.GaussianBlur(core, (0, 0), 0.03 * h)
+    ih, iw = img.shape[:2]
+    x0, y0 = int(0.9 * iw) - core.shape[1], int(0.9 * ih) - core.shape[0]
+    img[y0 - h:y0 + core.shape[0] + h, x0 - h:x0 + core.shape[1] + h] = (95, 55, 35)  # jeans
+    roi = img[y0:y0 + core.shape[0], x0:x0 + core.shape[1]]
+    out = roi.astype(np.float32)
+    out = out * (1 - 0.8 * glow[..., None]) + np.array((40, 50, 210)) * 0.8 * glow[..., None]
+    out = out * (1 - core[..., None]) + np.array((150, 225, 255)) * core[..., None]
+    roi[:] = np.clip(out, 0, 255).astype(np.uint8)
+
+
+@pytest.mark.parametrize("text,date", [("24 12 '00", "2000-12-24"), ("'02 7 11", "2002-07-11"),
+                                       ("'99 8 29", "1999-08-29")])
+def test_dotted_style(text, date):
+    """Each segment a separate bar with a wide glow (Album8's cameras, 1999-2009): 0 must not
+    read as 8, nor 7 as 9 or 1."""
+    img = make_print(9)
+    add_dotted_stamp(img, text)
+    st = find_stamp(*on_page(img))
+    assert st is not None and st.date == date, st
+
+
+@pytest.mark.parametrize("text", ["24 1_ '00", "'02 1_ 11"])
+def test_dotted_reading_with_a_lost_digit_gives_no_date(text):
+    """A digit nobody can see leaves its cell empty: the dotted reading of "24 1_ '00" must
+    not become 2000-01-24. (The empty cell is wider than a field gap, and padding only ever
+    sits before a one-digit field.)"""
+    from albumsplit.stamp import StampParams, candidates, rectify
+    img = make_print(9)
+    add_dotted_stamp(img, text)
+    page, corners = on_page(img)
+    sp = StampParams()
+    crop, _, valid = rectify(page, corners, None, sp)
+    dotted = [c for c in candidates(crop, valid, sp) if c.dotted and c.score > 0]
+    assert dotted and all(c.date is None for c in dotted), [(c.text, c.date) for c in dotted]
+
+
 def _line(glyphs: list[tuple[str, int, int]], h: int = 34, transform=None) -> "Candidate":
     """A read-ready line from (char, x0, x1) glyphs ("'" = apostrophe), each digit's patch a
     rendered seven-segment digit (passed through `transform` if given)."""
