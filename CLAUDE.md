@@ -90,6 +90,9 @@ Implemented in `albumsplit/review/` (vanilla JS, no build step/CDN). Notes:
   upright zoom of the stamp (`llm.read_stamp`); the answer replaces `stamp.date` (old OCR dates
   move to `date_alts`, `stamp.reader = "llm:<model>"`), or sets `photo.date` if no stamp box.
   Both are cached under `<work_dir>/llm/` and undoable with Ctrl+Z.
+- **F** / the ⚑ Flagged button limits navigation (←/→, N, Enter, jump list) to pages flagged for a
+  check (not approved, with `issues` or a photo with `needs_review`, as counted on the start page).
+  Remembered in `localStorage`.
 - `photos[].caption` / `photos[].date` are reviewer overrides; `None` = derive from the linked
   texts and the stamp (`model.effective_caption` / `effective_date`, which export must use).
   Derived captions are flattened to one line (`model.flatten_caption`: line breaks -> spaces,

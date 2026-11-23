@@ -24,6 +24,7 @@ const S = {
   version: 0, savedVersion: 0, saveTimer: null, saving: null, saveError: false,
   space: false,
   busy: false,               // waiting for Claude: edits are blocked, its answer replaces the page
+  flaggedOnly: localStorage.getItem("albumsplit.flaggedOnly") === "1",  // navigate flagged pages only
 };
 
 const colorOf = (pid) => PALETTE[(pid - 1) % PALETTE.length];
@@ -49,8 +50,42 @@ async function init() {
   if (!S.pages.length) { $("hint").textContent = "No pages in the work dir."; return; }
   const want = decodeURIComponent(location.hash.slice(1));
   let i = S.pages.findIndex((p) => p.page_id === want);
-  if (i < 0) i = Math.max(0, S.pages.findIndex((p) => p.status !== "approved"));
+  if (i < 0) i = Math.max(0, S.pages.findIndex((p) => p.status !== "approved" && visible(p)));
   await go(i);
+}
+
+// Flagged = what the start page counts as "flagged for a check".
+const isFlagged = (p) => p.status !== "approved" && (p.issues > 0 || p.needs_review > 0);
+const visible = (p) => !S.flaggedOnly || isFlagged(p);
+
+// Keep the page list entry in step with the page as saved/edited, so the filter follows it.
+function syncEntry(page) {
+  const entry = S.pages.find((p) => p.page_id === page.page_id);
+  if (!entry) return;
+  entry.status = page.status;
+  entry.issues = page.issues.length;
+  entry.needs_review = page.photos.filter((p) => p.needs_review).length;
+}
+
+// Next visible page in direction dir (+1/-1), or -1.
+function neighbour(dir) {
+  for (let j = S.idx + dir; j >= 0 && j < S.pages.length; j += dir) if (visible(S.pages[j])) return j;
+  return -1;
+}
+
+async function step(dir) {
+  const j = neighbour(dir);
+  if (j >= 0) return go(j);
+  hint(S.flaggedOnly ? "No more flagged pages this way." : dir > 0 ? "Last page." : "First page.");
+}
+
+async function toggleFlagged() {
+  S.flaggedOnly = !S.flaggedOnly;
+  localStorage.setItem("albumsplit.flaggedOnly", S.flaggedOnly ? "1" : "0");
+  renderBar();
+  if (!S.flaggedOnly || isFlagged(S.pages[S.idx])) return;
+  const j = nextUnreviewed();
+  if (j >= 0) await go(j); else hint("No flagged pages.");
 }
 
 function loadImage(url) {
@@ -85,14 +120,14 @@ function nextUnreviewed() {
   const n = S.pages.length;
   for (let d = 1; d <= n; d++) {
     const j = (S.idx + d) % n;
-    if (S.pages[j].status !== "approved") return j;
+    if (S.pages[j].status !== "approved" && visible(S.pages[j])) return j;
   }
   return -1;
 }
 
 async function setStatus(status) {
   mutate(() => { S.page.status = status; });
-  S.pages[S.idx].status = status;
+  syncEntry(S.page);
   renderBar();
 }
 
@@ -101,8 +136,9 @@ async function approveAndNext() {
   await flushSave();
   if (S.saveError) return;  // stay so nothing is lost
   S.saveError = false;
-  if (S.idx + 1 < S.pages.length) await go(S.idx + 1);
-  else hint("Last page approved.");
+  const j = neighbour(1);
+  if (j >= 0) await go(j);
+  else hint(S.flaggedOnly ? "Approved. No more flagged pages after this one." : "Last page approved.");
 }
 
 // ---------- saving ----------
@@ -145,7 +181,9 @@ async function save() {
         // Not during a drag either: it edits the page live and saves when it ends.
         if (S.version === v && !S.drag) { S.page = saved; renderPanel(); draw(); }
         const entry = S.pages.find((p) => p.page_id === pid);
-        if (entry) { entry.status = saved.status; entry.edited = true; }
+        if (entry) entry.edited = true;
+        syncEntry(saved);
+        renderBar();
       }
     } catch (e) {
       console.error(e);
@@ -526,7 +564,7 @@ function undo() {
   if (!prev) { hint("Nothing to undo"); return; }
   S.page = prev;
   if (S.sel && !(S.sel.kind === "photo" ? photoById(S.sel.id) : textById(S.sel.id))) S.sel = null;
-  S.pages[S.idx].status = S.page.status;
+  syncEntry(S.page);
   renderBar();
   changed();
 }
@@ -560,9 +598,14 @@ document.addEventListener("keydown", (e) => {
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   switch (e.key) {
     case "Enter": approveAndNext(); break;
-    case "ArrowRight": go(S.idx + 1); break;
-    case "ArrowLeft": go(S.idx - 1); break;
-    case "n": case "N": { const j = nextUnreviewed(); if (j >= 0) go(j); else hint("All pages approved."); break; }
+    case "ArrowRight": step(1); break;
+    case "ArrowLeft": step(-1); break;
+    case "n": case "N": {
+      const j = nextUnreviewed();
+      if (j >= 0) go(j); else hint(S.flaggedOnly ? "No other flagged pages." : "All pages approved.");
+      break;
+    }
+    case "f": case "F": toggleFlagged(); break;
     case "u": case "U": setStatus("proposed"); break;
     case "l": case "L": askPage(); break;
     case "r": rotateSelected(90); break;
@@ -587,9 +630,23 @@ function renderBar() {
     sel.innerHTML = "";
     for (const p of S.pages) sel.add(new Option(p.page_id, p.page_id));
   }
-  S.pages.forEach((p, i) => { sel.options[i].textContent = `${p.status === "approved" ? "✓" : p.edited ? "✎" : "·"} ${p.page_id}`; });
+  S.pages.forEach((p, i) => {
+    const opt = sel.options[i];
+    opt.textContent = `${p.status === "approved" ? "✓" : p.edited ? "✎" : "·"}${isFlagged(p) ? " ⚑" : ""} ${p.page_id}`;
+    opt.hidden = i !== S.idx && !visible(p);
+  });
   sel.selectedIndex = S.idx;
-  $("pos").textContent = `${S.idx + 1} / ${S.pages.length}`;
+  const flagged = S.pages.filter(isFlagged);
+  if (S.flaggedOnly) {
+    const k = flagged.indexOf(S.pages[S.idx]);
+    $("pos").textContent = `${k >= 0 ? k + 1 : "–"} / ${flagged.length} flagged`;
+  } else {
+    $("pos").textContent = `${S.idx + 1} / ${S.pages.length}`;
+  }
+  const fb = $("flagged");
+  fb.textContent = `⚑ Flagged (${flagged.length})`;
+  fb.classList.toggle("on", S.flaggedOnly);
+  fb.disabled = !S.flaggedOnly && !flagged.length;
   const b = $("status-badge");
   b.textContent = S.page.status; b.className = S.page.status;
   const done = S.pages.filter((p) => p.status === "approved").length;
@@ -600,8 +657,9 @@ function renderBar() {
 document.addEventListener("click", (e) => { if (e.target.closest("button")) e.target.closest("button").blur(); });
 
 $("jump").addEventListener("change", (e) => { go(e.target.selectedIndex); e.target.blur(); });
-$("prev").addEventListener("click", () => go(S.idx - 1));
-$("next").addEventListener("click", () => go(S.idx + 1));
+$("prev").addEventListener("click", () => step(-1));
+$("next").addEventListener("click", () => step(1));
+$("flagged").addEventListener("click", () => toggleFlagged());
 $("approve").addEventListener("click", () => approveAndNext());
 $("ask").addEventListener("click", () => askPage());
 
@@ -623,6 +681,7 @@ async function withClaude(label, url, done) {
       S.version++; S.savedVersion = S.version;
       const entry = S.pages.find((p) => p.page_id === pid);
       if (entry) entry.edited = true;
+      syncEntry(saved);
       renderBar();
       hint(done(saved));
     }
