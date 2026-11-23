@@ -185,9 +185,9 @@ def test_ones_are_narrow_and_stay_in_their_field(text, date):
 
 
 
-def _line(glyphs: list[tuple[str, int, int]], h: int = 34) -> "Candidate":
+def _line(glyphs: list[tuple[str, int, int]], h: int = 34, transform=None) -> "Candidate":
     """A read-ready line from (char, x0, x1) glyphs ("'" = apostrophe), each digit's patch a
-    rendered seven-segment digit."""
+    rendered seven-segment digit (passed through `transform` if given)."""
     from albumsplit.stamp import Candidate, _Glyph
     gl = []
     for ch, x0, x1 in glyphs:
@@ -195,6 +195,8 @@ def _line(glyphs: list[tuple[str, int, int]], h: int = 34) -> "Candidate":
             gl.append(_Glyph(x0, 0, x1, int(0.3 * h), "tick"))
             continue
         m = stamp_mask(ch, h)
+        if transform is not None:
+            m = transform(m)
         ys, xs = np.nonzero(m > 0.3)
         g = _Glyph(x0, 0, x1, h, "digit")
         g.patch = m[ys.min():ys.max() + 1, xs.min():xs.max() + 1] * 40
@@ -223,3 +225,44 @@ def test_missing_digit_gives_no_date():
     c = _line([g for g in _REAL_21_6_92 if g[0] != "6"])
     _read(c, StampParams())
     assert c.date is None
+
+
+def _shear(m: np.ndarray, slant: float) -> np.ndarray:
+    """Lean a rendered stamp to the right (italic LED digits): the top moves right by
+    slant * height / 2, the bottom left by as much."""
+    h, w = m.shape
+    pad = int(slant * h) + 2
+    mat = np.float32([[1, -slant, slant * h / 2 + pad], [0, 1, 0]])
+    return cv2.warpAffine(m, mat, (w + 2 * pad, h))
+
+
+@pytest.mark.parametrize("slant", [0.1, 0.15, 0.2])
+def test_italic_digits_are_read_upright(slant):
+    """Some cameras' LED digits lean right, so segments fall outside upright sample zones (the
+    lower right of an 8 looks dark). The line's slant is measured and taken out before
+    reading."""
+    from albumsplit.stamp import StampParams, _mean_cost, _read
+    glyphs = [("9", 0, 24), ("8", 30, 54), ("8", 90, 114), ("9", 150, 174)]
+    italic = _line(glyphs, transform=lambda m: _shear(m, slant))
+    _read(italic, StampParams())
+    assert italic.date == "1998-08-09"
+    assert abs(italic.slant - slant) <= 0.05
+    upright = _line(glyphs, transform=lambda m: _shear(m, slant))
+    _read(upright, StampParams(slants=(0.0,)))
+    assert _mean_cost(italic) < _mean_cost(upright)
+
+
+def test_noisy_high_resolution_scan():
+    """An uncompressed 600 dpi scan: the print is 2.5x larger than the search crop and every
+    pixel carries its own colour noise (film grain, scanner). The crop must average it away
+    rather than sample single pixels."""
+    img = make_print(10, light_corner=True)
+    add_stamp(img, "12 5 '92", alpha=0.45)
+    page, corners = on_page(img)
+    f = 2.5
+    big = cv2.resize(page, None, fx=f, fy=f, interpolation=cv2.INTER_CUBIC).astype(np.float32)
+    rng = np.random.default_rng(10)
+    big += rng.normal(0, 20, big.shape).astype(np.float32)
+    big = np.clip(big, 0, 255).astype(np.uint8)
+    st = find_stamp(big, [(x * f, y * f) for x, y in corners])
+    assert st is not None and st.date == "1992-05-12"

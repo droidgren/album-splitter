@@ -14,7 +14,7 @@ import hashlib
 import json
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -37,7 +37,7 @@ MODELS = [
 FALLBACK_MODELS = {"claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5",
                    "claude-fable-5-2", "claude-fable-5-1"}
 ISSUE_KINDS = ("missed_caption", "missed_photo", "merged_photos", "bad_frame", "other")
-PROMPT_VERSION = 2  # bump when the prompt or schema changes, invalidates the cache
+PROMPT_VERSION = 3  # bump when the prompt or schema changes, invalidates the cache
 PAGE_LONG_SIDE = 1568
 CROP_LONG_SIDE = 1200
 JPEG_QUALITY = 88
@@ -52,7 +52,10 @@ You get:
    middle. Each candidate text block found by a detector is outlined in black and labelled
    T<n> on a yellow tag.
 2. A close-up of each text block, labelled T<n>.
-3. A list of the photos, with the date the camera printed into the photo where one was read.
+3. A close-up of the date stamp on some photos, labelled S<n> for photo P<n>: small orange or
+   red seven-segment digits that the camera printed into the photo, turned to reading
+   direction. An OCR found the stamp there and read it, but its reading is often wrong.
+4. A list of the photos, with the OCR's reading of their stamps.
 
 For every text block, decide:
 - is_caption: true if it is handwriting or lettering that describes photos. False for
@@ -71,6 +74,16 @@ For every text block, decide:
   20xx only if 19xx is implausible next to the camera dates. null if the text implies no date.
 
 Return every text block exactly once, using the ids shown.
+
+For every stamp close-up S<n>, read the stamp yourself (do not just repeat the OCR):
+- photo_id: n.
+- found: true if the close-up shows a camera-printed date.
+- text: the stamp exactly as printed, with the spaces and apostrophe, e.g. "6 5 '95" or
+  "'93 7 14". Use ? for a digit you cannot read. Empty if not found.
+- date: the date as YYYY-MM-DD, or null if you cannot read every digit with confidence. The
+  year has two digits between '75 and '15; the order of day, month and year varies between
+  cameras (an apostrophe marks the year). The stamp shows what the camera's clock said, even
+  if a caption suggests another date.
 
 Also list in "issues" clear problems with the detected boxes, so a person can fix them:
 - missed_caption: handwriting on the paper that no T box covers. photo_ids: the photo it
@@ -101,6 +114,20 @@ SCHEMA: dict[str, Any] = {
                 "additionalProperties": False,
             },
         },
+        "stamps": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "photo_id": {"type": "integer"},
+                    "found": {"type": "boolean"},
+                    "text": {"type": "string"},
+                    "date": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                },
+                "required": ["photo_id", "found", "text", "date"],
+                "additionalProperties": False,
+            },
+        },
         "issues": {
             "type": "array",
             "items": {
@@ -115,7 +142,7 @@ SCHEMA: dict[str, Any] = {
             },
         },
     },
-    "required": ["texts", "issues"],
+    "required": ["texts", "stamps", "issues"],
     "additionalProperties": False,
 }
 
@@ -170,11 +197,21 @@ class TextAnswer:
 
 
 @dataclass
+class StampRead:
+    """Claude's reading of a stamp the OCR found (part of the page answer)."""
+    photo_id: int
+    found: bool
+    text: str
+    date: str | None
+
+
+@dataclass
 class LlmResult:
     texts: list[TextAnswer]
     issues: list[Issue]
     model: str
     cached: bool
+    stamps: list[StampRead] = field(default_factory=list)
 
 
 _PARTIAL_DATE = re.compile(r"^(\d{4})(?:-(\d{2}))?$")
@@ -247,7 +284,7 @@ class LlmLinker:
 
     def result(self, page: Page, data: dict, *, cached: bool) -> LlmResult:
         return LlmResult(texts=_validate(page, data), issues=_validate_issues(page, data),
-                         model=self.model, cached=cached)
+                         model=self.model, cached=cached, stamps=_validate_stamps(page, data))
 
     def prepare(self, page: Page, img_bgr: np.ndarray) -> Request:
         h = hashlib.sha256()
@@ -260,13 +297,26 @@ class LlmLinker:
             crop = _encode(text_crop(t, img_bgr, page.photos))
             h.update(crop)
             content += [{"type": "text", "text": f"T{t.id}:"}, _image(crop)]
+        for ph in page.photos:
+            if ph.stamp is not None:
+                zoom = _encode(stamp_zoom(img_bgr, ph.stamp.corners))
+                h.update(zoom)
+                content += [{"type": "text", "text": f"S{ph.id} (date stamp on P{ph.id}):"},
+                            _image(zoom)]
         lines = []
         for ph in page.photos:
-            stamp = ph.stamp.date if ph.stamp and ph.stamp.date else None
-            lines.append(f"P{ph.id}: camera date {stamp}" if stamp else f"P{ph.id}: no camera date")
+            st = ph.stamp
+            if st is None:
+                lines.append(f"P{ph.id}: no date stamp found")
+            else:
+                who = "OCR read" if st.reader == "ocr" else "read before as"
+                lines.append(f'P{ph.id}: date stamp S{ph.id}, {who} "{st.text or "?"}"'
+                             + (f" = {st.date}" if st.date else " (no valid date)"))
         ids = ", ".join(f"T{t.id}" for t in page.texts) or "(none detected)"
+        sids = ", ".join(f"S{ph.id}" for ph in page.photos if ph.stamp) or "(none)"
         prompt = ("Photos:\n" + ("\n".join(lines) or "(none detected)")
-                  + f"\n\nText blocks: {ids}\nAnswer for every text block, then list any issues.")
+                  + f"\n\nText blocks: {ids}\nStamp close-ups: {sids}\n"
+                  "Answer for every text block and every stamp close-up, then list any issues.")
         h.update(prompt.encode())
         content.append({"type": "text", "text": prompt})
         return Request(page_id=page.page_id, content=content, digest=h.hexdigest())
@@ -399,6 +449,56 @@ def _validate_issues(page: Page, data: dict) -> list[Issue]:
     return out
 
 
+def _validate_stamps(page: Page, data: dict) -> list[StampRead]:
+    asked = {p.id for p in page.photos if p.stamp is not None}
+    out: dict[int, StampRead] = {}
+    for item in data.get("stamps", []):
+        pid = item.get("photo_id")
+        if pid not in asked or pid in out:
+            continue
+        found = bool(item.get("found"))
+        out[pid] = StampRead(photo_id=pid, found=found,
+                             text=(item.get("text") or "").strip() if found else "",
+                             date=normalize_date(item.get("date")) if found else None)
+    return [out[p] for p in sorted(out)]
+
+
+def apply_stamps(page: Page, reads: list[StampRead], model: str) -> list[Issue]:
+    """Check the OCR's stamp readings against Claude's. Returns an issue per disagreement and
+    flags those photos for review.
+
+    Claude reads stamps far more reliably than the OCR (glow, dotted segments, faint digits),
+    so its date wins and the OCR's moves to `date_alts`. They agree if Claude reads the OCR's
+    date, or, where the OCR gave no date, one of its near-tie readings. Where Claude sees no
+    clear date, the OCR's date stays, flagged.
+    """
+    photos = {p.id: p for p in page.photos}
+    issues: list[Issue] = []
+    for r in reads:
+        ph = photos[r.photo_id]
+        st = ph.stamp
+        if st is None:
+            continue
+        before = (st.text, st.date)
+        if r.date is None and st.date is None:
+            continue  # neither can read it: undated either way, nothing to check
+        agree = r.date is not None and (r.date == st.date
+                                        or (st.date is None and r.date in st.date_alts))
+        if r.date is not None:
+            alts = [d for d in [st.date, *st.date_alts] if d and d != r.date]
+            st.date, st.date_alts = r.date, list(dict.fromkeys(alts))
+            st.text = r.text or st.text
+            st.reader = f"llm:{model}"
+        if not agree:
+            ph.needs_review = True
+            ocr = f'"{before[0] or "?"}" = {before[1] or "no date"}'
+            ai = f'"{r.text}" = {r.date or "no date"}' if r.found else "no stamp"
+            issues.append(Issue(kind="stamp_mismatch", photo_ids=[ph.id],
+                                note=f"P{ph.id} date stamp: OCR read {ocr}, Claude read {ai}"
+                                     + (" (kept the OCR date)" if r.date is None else "")))
+    return issues
+
+
 def apply(page: Page, result: LlmResult, *, keep_links: bool = False) -> None:
     """Replace the heuristic links and fill in transcription/date for texts Claude answered.
     Record the reported issues and flag the photos they concern for review.
@@ -406,11 +506,12 @@ def apply(page: Page, result: LlmResult, *, keep_links: bool = False) -> None:
     With `keep_links`, links already on the page stay as they are (a person may have set
     them) and Claude's links are only used for texts that have none yet.
     """
-    page.issues = [i for i in page.issues if i.source != "llm"] + result.issues
     photos = {p.id: p for p in page.photos}
     for issue in result.issues:
         for pid in issue.photo_ids:
             photos[pid].needs_review = True
+    stamp_issues = apply_stamps(page, result.stamps, result.model)
+    page.issues = [i for i in page.issues if i.source != "llm"] + result.issues + stamp_issues
     answered = {a.id: a for a in result.texts}
     linked = {lk.text_id for lk in page.links} if keep_links else set()
     page.links = [lk for lk in page.links if lk.text_id in linked or lk.text_id not in answered]

@@ -44,6 +44,14 @@ class StampParams:
     digit_h: tuple[float, ...] = (0.018, 0.021, 0.024, 0.027, 0.031, 0.035, 0.040, 0.046,
                                   0.052, 0.060, 0.068)
     b_weight: float = 0.3        # warm = a* + b_weight * b*
+    # Gaussian sigmas (crop px) on the colour before measuring warmth. Uncompressed scans keep
+    # the film grain and scanner noise in the colour; each sigma is searched and all readings
+    # vote together (see _vote), which is steadier than any single one.
+    chroma_blurs: tuple[float, ...] = (0.0, 1.0)
+    mask_levels: tuple[float, ...] = (1.0, 2.0)  # detection threshold multipliers, tried in turn
+    fallback_min_score: float = 4.0  # score needed by a stamp found at the later levels
+    # italic shear of the digits (x per y): some cameras' LEDs lean right, others are upright
+    slants: tuple[float, ...] = (0.0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3)
     low_abs: float = 4.0         # hysteresis thresholds on the warm contrast (Lab units) ...
     high_abs: float = 9.0
     low_k: float = 3.0           # ... or this many robust sigmas of the band's noise
@@ -55,6 +63,9 @@ class StampParams:
     year_pivot: int = 70         # two-digit years >= pivot are 19YY, below 20YY
     years: tuple[int, int] = (1975, 2015)  # era of date-imprinting film cameras
     alt_gap: float = 0.5         # keep other dates whose readings cost less extra than this
+    # A digit that alone reads as nothing (cost above this, e.g. half hidden behind hair) may
+    # still complete a valid date, but that date is a guess: keep it for review only.
+    max_digit_cost: float = 2.3
     max_mean_cost: float = 1.5   # digits fit worse than this on average: keep text, no date
     # A gap wider than this (x digit height) inside a line has room for a whole digit: one was
     # probably missed (too faint), so the date read without it is not trusted. Field gaps on
@@ -107,6 +118,7 @@ class Candidate:
     flipped: bool                         # found in the crop rotated by 180°
     contrast: float
     regrouped: bool = False               # fields only came out right after joining two
+    slant: float = 0.0                    # italic shear of the digits (x per y)
     score: float = 0.0
     text: str = ""
     fields: list[str] = field(default_factory=list)
@@ -122,18 +134,69 @@ def find_stamp(img_bgr: np.ndarray, corners: list[Point], outline: list[Point] |
     """Locate and read the date stamp of one photo. `corners` are TL, TR, BR, BL (full res)."""
     sp = sp or StampParams()
     crop, M, valid = rectify(img_bgr, corners, outline, sp)
-    cands = candidates(crop, valid, sp)
-    if not cands:
+    best = None
+    for i, level in enumerate(sp.mask_levels):
+        # A bright stamp on a warm background can merge with its glow and surroundings into
+        # blobs too big for digits: if nothing stamp-like was found, look again at stricter
+        # thresholds. (Only then: more readings of every line also mean more misreads.)
+        # (The stricter levels look again for one bright stamp that the first missed: one blur
+        # will do there, and most photos have no stamp, so this pass runs for nearly all.)
+        blurs = sp.chroma_blurs if i == 0 else sp.chroma_blurs[-1:]
+        cands = [c for blur in blurs for c in candidates(crop, valid, sp, level, blur)]
+        best = max(cands, key=lambda c: c.score) if cands else None
+        need = sp.min_score if best and best.date else sp.min_score_undated
+        if i > 0:
+            need = max(need, sp.fallback_min_score)  # (a second look must find a clear stamp)
+        if best and best.score >= need:
+            break
+    else:
         return None
-    best = max(cands, key=lambda c: c.score)
-    if best.score < (sp.min_score if best.date else sp.min_score_undated):
-        return None
-    if best.date and _mean_cost(best) > sp.max_mean_cost:
-        # A stamp, but the digits are too damaged to trust the date: leave it for review.
-        best.date_alts = [best.date] + best.date_alts
-        best.date = None
+    for c in cands:
+        if c.date and (_mean_cost(c) > sp.max_mean_cost or _worst_cost(c) > sp.max_digit_cost):
+            # A stamp, but the digits are too damaged to trust the date: leave it for review.
+            c.date_alts = [c.date] + c.date_alts
+            c.date = None
+    best = _vote(best, cands)
     return DateStamp(corners=_box_to_page(best, crop.shape[:2], M), text=best.text, date=best.date,
                      date_alts=best.date_alts, score=round(best.score, 2))
+
+
+def _vote(best: Candidate, cands: list[Candidate]) -> Candidate:
+    """Read the best line by majority over all its readings.
+
+    The same stamp is found at several digit sizes and thresholds, and each reading sees a
+    slightly different version of its faintest segments. The single best-scoring reading is
+    the one whose noise happened to fit best, so a 6 may win as a 5 by a hair. Summing the
+    scores per date over every reading of the line is far steadier. "No date" takes part in
+    the vote too.
+    """
+    def same_line(c: Candidate) -> bool:
+        if c.flipped != best.flipped:
+            return False
+        ox = min(c.box[2], best.box[2]) - max(c.box[0], best.box[0])
+        oy = min(c.box[3], best.box[3]) - max(c.box[1], best.box[1])
+        return (ox > 0.5 * min(c.box[2] - c.box[0], best.box[2] - best.box[0])
+                and oy > 0.5 * min(c.box[3] - c.box[1], best.box[3] - best.box[1]))
+
+    votes: dict[str | None, float] = {}
+    for c in cands:
+        if same_line(c) and c.score > 0:
+            votes[c.date] = votes.get(c.date, 0.0) + c.score
+    if not votes:
+        return best
+    ranked = sorted(votes, key=lambda d: -votes[d])
+    win = ranked[0]
+    if win != best.date:
+        best = max((c for c in cands if same_line(c) and c.date == win), key=lambda c: c.score)
+    others = [d for d in ranked[1:] if d and votes[d] >= 0.25 * votes[win]]
+    best.date_alts = others + [a for a in best.date_alts if a not in others and a != win]
+    return best
+
+
+def _worst_cost(c: Candidate) -> float:
+    """How badly the worst of the chosen digits (ones aside) explains its glyph."""
+    costs = [g.costs.get(g.char, 3.0) for g in c.glyphs if g.kind == "digit" and g.char != "1"]
+    return float(max(costs)) if costs else 3.0
 
 
 def _mean_cost(c: Candidate) -> float:
@@ -226,14 +289,41 @@ def rectify(img_bgr: np.ndarray, corners: list[Point], outline: list[Point] | No
         cw, ch = max(1, round(h * s)), max(1, round(w * s))
         dst = np.array([(cw, 0), (cw, ch), (0, ch), (0, 0)], np.float32)
     M = cv2.getPerspectiveTransform(src, dst)
-    crop = cv2.warpPerspective(img_bgr, M, (cw, ch), flags=cv2.INTER_AREA,
-                               borderMode=cv2.BORDER_CONSTANT, borderValue=(128, 128, 128))
+    crop = _warp(img_bgr, src, M, s, (cw, ch))
     valid = np.full((ch, cw), 255, np.uint8)
     if outline:
         valid[:] = 0
         poly = cv2.perspectiveTransform(np.asarray(outline, np.float32).reshape(-1, 1, 2), M)
         cv2.fillPoly(valid, [np.round(poly).astype(np.int32)], 255)
     return crop, M, valid
+
+
+def _warp(img_bgr: np.ndarray, src: np.ndarray, M: np.ndarray, s: float, size: tuple[int, int]
+          ) -> np.ndarray:
+    """warpPerspective with a proper area-averaging downscale.
+
+    warpPerspective has no INTER_AREA (it falls back to bilinear), so shrinking a 600 dpi scan
+    by 2-3x would sample single pixels: thin LED strokes break up and the scanner's colour
+    noise stays at full strength. The photo's bounding box is shrunk with cv2.resize first, and
+    only the remaining small rotation/perspective goes through the warp.
+    """
+    border = dict(borderMode=cv2.BORDER_CONSTANT, borderValue=(128, 128, 128))
+    if s > 0.8:
+        return cv2.warpPerspective(img_bgr, M, size, flags=cv2.INTER_LINEAR, **border)
+    H, W = img_bgr.shape[:2]
+    x0, y0 = np.floor(src.min(axis=0)).astype(int) - 2
+    x1, y1 = np.ceil(src.max(axis=0)).astype(int) + 2
+    x0, y0, x1, y1 = max(0, x0), max(0, y0), min(W, x1), min(H, y1)
+    if x1 <= x0 or y1 <= y0:
+        return cv2.warpPerspective(img_bgr, M, size, flags=cv2.INTER_LINEAR, **border)
+    region = img_bgr[y0:y1, x0:x1]
+    sw, sh = max(1, round((x1 - x0) * s)), max(1, round((y1 - y0) * s))
+    small = cv2.resize(region, (sw, sh), interpolation=cv2.INTER_AREA)
+    # small pixel u is the mean of page pixels around x0 + (u + 0.5) * fx - 0.5
+    fx, fy = (x1 - x0) / sw, (y1 - y0) / sh
+    T = np.array([[fx, 0, x0 + 0.5 * fx - 0.5], [0, fy, y0 + 0.5 * fy - 0.5], [0, 0, 1]],
+                 np.float64)
+    return cv2.warpPerspective(small, M @ T, size, flags=cv2.INTER_LINEAR, **border)
 
 
 def _box_to_page(c: Candidate, shape: tuple[int, int], M: np.ndarray) -> list[Point]:
@@ -282,29 +372,37 @@ def warm_contrast(warm: np.ndarray, reddish: np.ndarray, kernel: int) -> np.ndar
     return d
 
 
-def stamp_mask(d: np.ndarray, valid: np.ndarray, sp: StampParams) -> tuple[np.ndarray, float]:
-    """Hysteresis threshold of the warm contrast, adapted to the band's noise."""
+def stamp_mask(d: np.ndarray, valid: np.ndarray, sp: StampParams, level: float = 1.0
+               ) -> tuple[np.ndarray, float]:
+    """Hysteresis threshold of the warm contrast, adapted to the band's noise.
+
+    Returns (mask, lo) where lo is the low threshold at level 1 (the band's noise floor);
+    `level` scales both thresholds for the mask."""
     v = d[valid > 0]
     if v.size == 0:
         return np.zeros(d.shape, np.uint8), 1.0
+    v = v[::7]  # (a sample is as good for the noise level, and much faster)
     sigma = 1.4826 * float(np.median(np.abs(v - np.median(v)))) + 0.5
-    lo = max(sp.low_abs, sp.low_k * sigma)
-    hi = max(sp.high_abs, sp.high_k * sigma)
+    base = max(sp.low_abs, sp.low_k * sigma)
+    lo = level * base
+    hi = level * max(sp.high_abs, sp.high_k * sigma)
     low = ((d > lo) & (valid > 0)).astype(np.uint8)
     n, labels = cv2.connectedComponents(low, connectivity=8)
     strong = np.zeros(n, bool)
     strong[np.unique(labels[(d > hi) & (low > 0)])] = True
     strong[0] = False
-    return strong[labels].astype(np.uint8) * 255, lo
+    return strong[labels].astype(np.uint8) * 255, base
 
 
-def candidates(crop: np.ndarray, valid: np.ndarray, sp: StampParams) -> list[Candidate]:
-    """All stamp-like lines in both search bands, at every digit size, each with its reading."""
+def candidates(crop: np.ndarray, valid: np.ndarray, sp: StampParams, level: float = 1.0,
+               blur: float = 0.0) -> list[Candidate]:
+    """All stamp-like lines in both search bands, at every digit size, each with its reading.
+    `level` scales the detection thresholds (see stamp_mask)."""
     ch, cw = crop.shape[:2]
     short = min(ch, cw)
     band = max(8, int(sp.band * short))
     y_off = ch - band
-    warm, reddish = warmth(crop, sp)
+    warm, reddish = warmth(cv2.GaussianBlur(crop, (0, 0), blur) if blur > 0 else crop, sp)
     out: list[Candidate] = []
     for frac in sp.digit_h:
         h = frac * short
@@ -317,7 +415,7 @@ def candidates(crop: np.ndarray, valid: np.ndarray, sp: StampParams) -> list[Can
                 warm_contrast(np.ascontiguousarray(w_[y_off - pad:]), r_[y_off - pad:], k)[pad:])
             vb = np.ascontiguousarray(v_[y_off:])
             wb, rb = w_[y_off:], r_[y_off:]
-            mask, lo = stamp_mask(db, vb, sp)
+            mask, lo = stamp_mask(db, vb, sp, level)
             if not mask.any():
                 continue
             for c in _lines(mask, db, h, lo):
@@ -479,11 +577,15 @@ def _lines(mask: np.ndarray, d: np.ndarray, h: float, lo: float) -> list[Candida
     glyphs.sort(key=lambda g: g.x0)
 
     lines: list[list[_Glyph]] = []
+    active: list[list[_Glyph]] = []  # lines that can still grow (glyphs come in x order)
     for g in glyphs:
         placed = False
-        for ln in lines:
+        # A line ending further left than the reach of a gap takes no later glyph either:
+        # dropping it keeps this linear in the many specks of a noisy scan.
+        active = [ln for ln in active if g.x0 - ln[-1].x1 <= 2.6 * h]
+        for ln in active:
             last = ln[-1]
-            if g.x0 - last.x1 > 2.6 * h or g.x0 < last.x1 - 0.3 * h:
+            if g.x0 < last.x1 - 0.3 * h:
                 continue
             digits = [o for o in ln if o.kind == "digit"]
             if not digits:  # a lone tick: the next digit must follow right after it ('93)
@@ -504,6 +606,7 @@ def _lines(mask: np.ndarray, d: np.ndarray, h: float, lo: float) -> list[Candida
                 break
         if not placed:
             lines.append([g])  # (a tick can start a line: '93 7 14)
+            active.append(lines[-1])
 
     out = []
     for ln in lines:
@@ -627,7 +730,18 @@ def segment_levels(patch: np.ndarray) -> dict[str, float]:
     return {k: float(np.clip((v - floor) / (top - floor), 0, 1)) for k, v in lv.items()}
 
 
-def _digit_costs(patch: np.ndarray, h: float, narrow: bool = False) -> dict[str, float]:
+def _unslant(patch: np.ndarray, slant: float) -> np.ndarray:
+    """Shear an italic glyph upright: the top row moves left by slant * height / 2, the bottom
+    row right by as much."""
+    gh, gw = patch.shape
+    pad = int(np.ceil(abs(slant) * gh / 2)) + 1
+    m = np.float32([[1, slant, pad - slant * gh / 2], [0, 1, 0]])
+    return cv2.warpAffine(patch.astype(np.float32), m, (gw + 2 * pad, gh), flags=cv2.INTER_LINEAR,
+                          borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+
+def _digit_costs(patch: np.ndarray, h: float, narrow: bool = False, slant: float = 0.0
+                 ) -> dict[str, float]:
     """How badly each digit explains one glyph (0 = perfectly; missing = impossible).
 
     Wide glyphs are read from their segment levels: a digit costs (1 - level) for each
@@ -638,6 +752,8 @@ def _digit_costs(patch: np.ndarray, h: float, narrow: bool = False) -> dict[str,
     # strokes themselves.
     if patch is None or patch.size == 0 or patch.max() <= 0:
         return {}
+    if slant:
+        patch = _unslant(patch, slant)
     ys, xs = np.nonzero(patch > 0.4 * patch.max())
     patch = patch[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
     gh, gw = patch.shape
@@ -646,7 +762,17 @@ def _digit_costs(patch: np.ndarray, h: float, narrow: bool = False) -> dict[str,
     if narrow or gw < 0.33 * h:
         prof = patch.mean(axis=1)
         filled = float((prof > 0.25 * prof.max()).mean())
-        return {"1": 3 * (1 - filled)} if filled > 0.6 else {}
+        if filled <= 0.6:
+            return {}
+        c1 = 3 * (1 - filled)
+        # A 7 whose top segment is a short dot (cameras with dotted segments) is as narrow as
+        # a 1, but its top reaches left of the vertical bar, where a 1 has nothing.
+        lit = patch > 0.4 * patch.max()
+        top = np.nonzero(lit[:max(1, int(0.2 * gh))].any(axis=0))[0]
+        low = np.nonzero(lit[int(0.55 * gh):].any(axis=0))[0]
+        if top.size and low.size and low[0] - top[0] >= 0.2 * h:
+            return {"7": c1, "1": c1 + 1.5}
+        return {"1": c1}
     lv = segment_levels(patch)
     cost: dict[str, float] = {}
     for segs, ch in _SEGMENTS.items():
@@ -678,10 +804,11 @@ def _read(c: Candidate, sp: StampParams) -> None:
     # A "1" is one bar where other digits are a box: a glyph much narrower than the line's
     # other digits is read as a 1 even when glow makes it wider than a bare stroke.
     one_w = 0.62 * _digit_width(c)
-    for g in c.glyphs:
-        if g.kind == "digit":
-            g.costs = _digit_costs(g.patch, c.digit_h, narrow=g.x1 - g.x0 < one_w)
-            g.char = _best_char(g.costs)
+    digits = [g for g in c.glyphs if g.kind == "digit"]
+    c.slant = _slant(c, sp)
+    for g in digits:
+        g.costs = _digit_costs(g.patch, c.digit_h, narrow=g.x1 - g.x0 < one_w, slant=c.slant)
+        g.char = _best_char(g.costs)
     for use_ticks in (True, False):
         groups, year_field = _fields(c, use_ticks)
         found = _best_date(groups, year_field, sp)
@@ -711,6 +838,22 @@ def _read(c: Candidate, sp: StampParams) -> None:
             c.date_alts = [c.date] + c.date_alts
             c.date = None
     c.text = " ".join(("'" if i == year_field else "") + f for i, f in enumerate(c.fields))
+
+
+def _slant(c: Candidate, sp: StampParams) -> float:
+    """The line's italic slant: the shear (x per y) that makes its vertical strokes sharpest,
+    i.e. that concentrates the glyphs' warmth into the fewest columns."""
+    best, best_v = 0.0, -1.0
+    for slant in sp.slants:
+        v = 0.0
+        for g in c.glyphs:
+            if g.kind != "digit" or g.patch is None or g.patch.size == 0:
+                continue
+            col = _unslant(g.patch, slant).sum(axis=0)
+            v += float((col ** 2).sum())
+        if v > best_v * (1 + 1e-6):
+            best, best_v = slant, v
+    return best
 
 
 def _digit_width(c: Candidate) -> float:

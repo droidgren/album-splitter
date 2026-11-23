@@ -85,7 +85,8 @@ class Link:
     photo_id: int
 
 
-IssueKind = Literal["missed_caption", "missed_photo", "merged_photos", "bad_frame", "other"]
+IssueKind = Literal["missed_caption", "missed_photo", "merged_photos", "bad_frame", "other",
+                    "stamp_mismatch"]
 
 
 @dataclass

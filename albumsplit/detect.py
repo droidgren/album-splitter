@@ -39,6 +39,7 @@ class Params:
     split_clear_bite: float = 0.9   # ... or whose missing area is at least this much clean paper
     max_aspect: float = 4.0
     frame_merge_reach: float = 0.12  # pieces this close (x long side) may be one framed print
+    frame_reach: int = 4            # px a print's edge may lie off a rect side (_framed_sides)
     # text
     photo_margin_frac: float = 0.004
     ink_dark: float = 32.0          # darkness vs local background for any ink
@@ -874,7 +875,7 @@ def _framed_sides(rect: tuple, grad: tuple[np.ndarray, np.ndarray], p: Params,
     for n, along, half, length in ((u, v, rw / 2, rh), (v, u, rh / 2, rw)):
         for sign in (-1, 1):
             best = 0.0
-            for o in range(-3, 4):
+            for o in range(-p.frame_reach, p.frame_reach + 1):
                 ts = np.linspace(-0.45, 0.45, 200) * length
                 pts = c + n * (sign * (half + o)) + ts[:, None] * along
                 xs, ys = pts[:, 0], pts[:, 1]

@@ -33,6 +33,11 @@ re-run or reviewed later without losing manual edits.
   date (years 1975–2015). Stored as `photos[].stamp` with `corners`, raw `text`, `date` and the
   near-tie `date_alts`. Near-ties are settled against the other stamps on the page. Export uses
   `stamp.date` for `DateTimeOriginal` ahead of handwritten dates. `--no-stamps` turns it off.
+  Tuned for uncompressed 600 dpi scans (PNG/TIFF): the photo is shrunk with area averaging
+  before the warp (`_warp`), the search runs on the raw colour and a 1 px chroma blur and all
+  readings of a line vote on the date (`_vote`), italic digits are deslanted per line (`_slant`),
+  a stricter threshold is tried only if nothing was found (`mask_levels`), and a date that needs
+  a digit unreadable on its own (`max_digit_cost`) stays undated. Misreads are worse than misses.
 - **Linking (heuristic baseline)**: each text block → photo with the smallest edge-to-edge
   distance, preferring horizontal adjacency. Allow many-to-many links.
 - **Linking (optional, `--llm`)**: send the downscaled page plus numbered boxes overlaid to
@@ -40,6 +45,12 @@ re-run or reviewed later without losing manual edits.
   transcription of each text block, and a normalized date if one is derivable
   (e.g. "Annandag jul -84" → 1984-12-26; date stamps printed in the photo like "98 6 26").
   Geometry always comes from OpenCV; the LLM only does linking + reading.
+  The same request checks the date stamps: a close-up of every stamp the OCR found (`S<n>`) goes
+  along with the OCR's reading, and Claude reads it again (`llm.apply_stamps`). Claude's date wins
+  (the OCR's moves to `date_alts`, `reader = "llm:<model>"`). A disagreement (or Claude unable to
+  read a stamp the OCR dated, which keeps the OCR date) flags the photo with a `stamp_mismatch`
+  issue. On the raw samples Opus got all 41 OCR-found stamps right; Haiku leaves more wrong dates,
+  but flagged. Stamps the OCR did not find at all are not checked.
 
 Output: `<work_dir>/pages/<page_id>.json` with `photos[]`, `texts[]`, `links[]`,
 `status: "proposed" | "approved"`.
