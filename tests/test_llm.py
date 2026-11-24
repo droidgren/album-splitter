@@ -103,3 +103,42 @@ def test_request_carries_a_closeup_of_each_stamp():
     prompt = labels[-1]
     assert 'OCR read "6 5 \'95" = 1995-05-06' in prompt and "P2: no date stamp found" in prompt
     assert "Stamp close-ups: S1, S3" in prompt
+
+
+def test_stamp_request_without_a_box_sends_corner_closeups():
+    """Shrunk to page size a small stamp is unreadable: with no stamp box, the four corners go
+    along at full resolution, the top ones turned 180° (a stamp there is upside down)."""
+    from albumsplit.llm import stamp_corners
+    img = np.full((1200, 1600, 3), 120, np.uint8)
+    corners = quad(100, 100, 1100, 800)  # landscape, 1000 x 700
+    img[110:130, 110:150] = (0, 0, 255)  # a red mark in the top left corner
+    crops = dict(stamp_corners(img, corners))
+    assert list(crops) == ["bottom right", "top left, turned", "bottom left", "top right, turned"]
+    tl = crops["top left, turned"]
+    assert tl.shape[:2] == (154, 450)
+    ys, xs = np.nonzero(tl[..., 2] > 200)
+    assert ys.min() > tl.shape[0] * 0.8 and xs.min() > tl.shape[1] * 0.85  # turned: now bottom right
+    # A portrait print is turned to landscape first: its corner crops run along the long edges.
+    portrait = dict(stamp_corners(img, quad(100, 100, 800, 1100)))
+    assert portrait["bottom right"].shape[1] > portrait["bottom right"].shape[0]
+    linker = LlmLinker.__new__(LlmLinker)
+    linker.model = "m"
+    page = Page(page_id="p", source="p.png", width=1600, height=1200,
+                photos=[Photo(id=1, corners=corners)])
+    content, _ = linker.prepare_stamp(page, page.photos[0], img)
+    assert sum(c["type"] == "image" for c in content) == 5  # the photo + 4 corners
+
+
+def test_marked_stamp_takes_claudes_reading_unflagged():
+    """A box marked in review has no OCR reading to disagree with."""
+    st = DateStamp(corners=quad(0, 40, 30, 50), manual=True)
+    page = _page(st)
+    _apply(page, StampRead(1, True, "8 5 '93", "1993-05-08"))
+    ph = page.photos[0]
+    assert ph.stamp.date == "1993-05-08" and ph.stamp.text == "8 5 '93"
+    assert ph.stamp.reader == "llm:m" and not ph.needs_review and not page.issues
+    linker = LlmLinker.__new__(LlmLinker)
+    linker.model = "m"
+    req = linker.prepare(_page(DateStamp(corners=quad(0, 40, 30, 50), manual=True)),
+                         np.full((200, 500, 3), 200, np.uint8))
+    assert "P1: date stamp S1, marked in review, not read yet" in req.content[-1]["text"]

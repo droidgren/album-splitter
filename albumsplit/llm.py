@@ -310,8 +310,11 @@ class LlmLinker:
                 lines.append(f"P{ph.id}: no date stamp found")
             else:
                 who = "OCR read" if st.reader == "ocr" else "read before as"
-                lines.append(f'P{ph.id}: date stamp S{ph.id}, {who} "{st.text or "?"}"'
-                             + (f" = {st.date}" if st.date else " (no valid date)"))
+                if st.manual and st.date is None:
+                    lines.append(f"P{ph.id}: date stamp S{ph.id}, marked in review, not read yet")
+                else:
+                    lines.append(f'P{ph.id}: date stamp S{ph.id}, {who} "{st.text or "?"}"'
+                                 + (f" = {st.date}" if st.date else " (no valid date)"))
         ids = ", ".join(f"T{t.id}" for t in page.texts) or "(none detected)"
         sids = ", ".join(f"S{ph.id}" for ph in page.photos if ph.stamp) or "(none)"
         prompt = ("Photos:\n" + ("\n".join(lines) or "(none detected)")
@@ -362,8 +365,20 @@ class LlmLinker:
         if st is not None:
             zoom = _encode(stamp_zoom(img_bgr, st.corners))
             h.update(zoom)
-            content += [{"type": "text", "text": "Close-up of where a detector found the stamp, "
+            where = ("where the reviewer marked the stamp" if st.manual
+                     else "where a detector found the stamp")
+            content += [{"type": "text", "text": f"Close-up of {where}, "
                                                  "turned to reading direction:"}, _image(zoom)]
+        else:
+            # Shrunk to the page size, a small or faint stamp is only a few pixels: show the
+            # places it can be at full resolution.
+            content.append({"type": "text", "text": "No stamp was detected. Close-ups of the "
+                            "four corners of the photo, where a camera stamp would be (the top "
+                            "ones turned 180°, so a stamp there reads upright):"})
+            for name, crop in stamp_corners(img_bgr, photo.corners):
+                jpg = _encode(crop)
+                h.update(jpg)
+                content += [{"type": "text", "text": f"{name}:"}, _image(jpg)]
         others = sorted({p.stamp.date for p in page.photos
                          if p.id != photo.id and p.stamp and p.stamp.date})
         lines = []
@@ -471,6 +486,9 @@ def apply_stamps(page: Page, reads: list[StampRead], model: str) -> list[Issue]:
     so its date wins and the OCR's moves to `date_alts`. They agree if Claude reads the OCR's
     date, or, where the OCR gave no date, one of its near-tie readings. Where Claude sees no
     clear date, the OCR's date stays, flagged.
+
+    A box marked in review that is not read yet has no OCR reading to check: it just takes
+    Claude's reading.
     """
     photos = {p.id: p for p in page.photos}
     issues: list[Issue] = []
@@ -478,6 +496,12 @@ def apply_stamps(page: Page, reads: list[StampRead], model: str) -> list[Issue]:
         ph = photos[r.photo_id]
         st = ph.stamp
         if st is None:
+            continue
+        if st.manual and st.date is None:
+            if r.found:
+                st.text = r.text or st.text
+                if r.date is not None:
+                    st.date, st.reader = r.date, f"llm:{model}"
             continue
         before = (st.text, st.date)
         if r.date is None and st.date is None:
@@ -628,6 +652,41 @@ def stamp_zoom(img_bgr: np.ndarray, corners: list[Point], grow_w: float = 1.6,
         f = min_h / crop.shape[0]
         crop = cv2.resize(crop, None, fx=f, fy=f, interpolation=cv2.INTER_CUBIC)
     return crop
+
+
+CORNER_W, CORNER_H = 0.45, 0.22  # corner close-ups: fraction of the photo's long / short side
+CORNER_LONG_SIDE = 1000
+
+
+def stamp_corners(img_bgr: np.ndarray, corners: list[Point]) -> list[tuple[str, np.ndarray]]:
+    """Full-resolution crops of the four corners of a photo, along its long edges.
+
+    In the camera's orientation the stamp runs along the bottom long edge, so with the photo
+    turned to landscape it reads upright at the bottom, and upside down at the top (a print
+    lying the other way round): the top crops are turned 180°."""
+    q = np.array(corners, np.float64)
+    w = np.linalg.norm(q[1] - q[0]) + np.linalg.norm(q[2] - q[3])
+    h = np.linalg.norm(q[3] - q[0]) + np.linalg.norm(q[2] - q[1])
+    if h > w:
+        q = q[[3, 0, 1, 2]]  # turn clockwise: the old bottom left becomes the top left
+
+    def at(u: float, v: float) -> tuple[float, float]:
+        top, bottom = q[0] + u * (q[1] - q[0]), q[3] + u * (q[2] - q[3])
+        p = top + v * (bottom - top)
+        return float(p[0]), float(p[1])
+
+    out = []
+    for name, u0, v0, flip in [("bottom right", 1 - CORNER_W, 1 - CORNER_H, False),
+                               ("top left, turned", 0.0, 0.0, True),
+                               ("bottom left", 0.0, 1 - CORNER_H, False),
+                               ("top right, turned", 1 - CORNER_W, 0.0, True)]:
+        u1, v1 = u0 + CORNER_W, v0 + CORNER_H
+        quad = [at(u0, v0), at(u1, v0), at(u1, v1), at(u0, v1)]
+        if flip:
+            quad = quad[2:] + quad[:2]
+        crop = warp_quad(img_bgr, quad)
+        out.append((name, downscale(crop, CORNER_LONG_SIDE)[0]))
+    return out
 
 
 def _encode(img: np.ndarray) -> bytes:

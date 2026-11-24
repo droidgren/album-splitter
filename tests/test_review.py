@@ -292,6 +292,21 @@ def test_ask_claude_for_stamp(env, monkeypatch):
     assert client.post("/api/pages/p1/photos/9/stamp").status_code == 404
 
 
+def test_mark_stamp_box(env):
+    client, work, _ = env
+    # The box is kept as the photo's stamp, unread, for Claude.
+    box = quad(3400, 1250, 3750, 1350)
+    r = client.post("/api/pages/p1/photos/2/stamp_box", json={"box": box})
+    assert r.status_code == 200, r.text
+    st = r.json()["photos"][1]["stamp"]
+    assert st["manual"] and st["date"] is None
+    assert [tuple(map(round, c)) for c in st["corners"]] == box  # bottom half: reads as drawn
+    page = Page.load(page_json_path(work, "p1"))
+    assert page.edited and page.photos[1].stamp.manual
+    assert client.post("/api/pages/p1/photos/2/stamp_box", json={"box": box[:3]}).status_code == 422
+    assert client.post("/api/pages/p1/photos/9/stamp_box", json={"box": box}).status_code == 404
+
+
 def test_claude_unavailable_is_503(env, monkeypatch):
     client, _, _ = env
     from albumsplit.llm import LlmUnavailable

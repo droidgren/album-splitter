@@ -109,7 +109,15 @@ Implemented in `albumsplit/review/` (vanilla JS, no build step/CDN). Notes:
   (always a fresh call). "Read stamp with Claude" per photo sends the rectified photo plus an
   upright zoom of the stamp (`llm.read_stamp`); the answer replaces `stamp.date` (old OCR dates
   move to `date_alts`, `stamp.reader = "llm:<model>"`), or sets `photo.date` if no stamp box.
-  Both are cached under `<work_dir>/llm/` and undoable with Ctrl+Z.
+  Both are cached under `<work_dir>/llm/` and undoable with Ctrl+Z. With no stamp box, the
+  stamp request also carries full-resolution close-ups of the photo's four corners
+  (`llm.stamp_corners`, top ones turned 180°): shrunk to page size a stamp is only a few pixels.
+- **S** / "Mark stamp" (or **Alt**+drag on a photo) marks where a missed stamp is
+  (`POST .../photos/<id>/stamp_box`). Only the box is saved (`stamp.orient_box` turns it to
+  reading direction), as an unread `stamp` with `manual: true`: no OCR, which already searched
+  there. "Read stamp with Claude" and the page request (L) send a zoom of it; Claude's reading
+  fills it in. × removes a stamp box. (Keeping detection's best unreadable line as a "possible
+  stamp" was tried: on the raw samples at most 1 of 42 was a real stamp, so it was dropped.)
 - **F** / the ⚑ Flagged button limits navigation (←/→, N, Enter, jump list) to pages flagged for a
   check (not approved, with `issues` or a photo with `needs_review`, as counted on the start page).
   Remembered in `localStorage`.

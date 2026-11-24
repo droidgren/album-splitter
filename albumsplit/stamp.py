@@ -145,7 +145,35 @@ def find_stamp(img_bgr: np.ndarray, corners: list[Point], outline: list[Point] |
     """Locate and read the date stamp of one photo. `corners` are TL, TR, BR, BL (full res)."""
     sp = sp or StampParams()
     crop, M, valid = rectify(img_bgr, corners, outline, sp)
-    best = None
+    found = _search(crop, valid, sp)
+    if found is None:
+        return None
+    best = _settle(*found, sp)
+    return DateStamp(corners=_box_to_page(best, crop.shape[:2], M), text=best.text, date=best.date,
+                     date_alts=best.date_alts, score=round(best.score, 2))
+
+
+def orient_box(corners: list[Point], box: list[Point], sp: StampParams | None = None
+               ) -> list[Point]:
+    """A stamp box marked in review (any 4 points around it) as stamp corners: TL, TR, BR, BL
+    in reading direction, page coords. `corners` are the photo's.
+
+    The stamp runs along the long edge: in the landscape crop it reads left to right in the
+    bottom half and upside down in the top half."""
+    _, M, (cw, ch), _ = _crop_geometry(corners, sp or StampParams())
+    q = cv2.perspectiveTransform(np.asarray(box, np.float32).reshape(-1, 1, 2), M).reshape(-1, 2)
+    x0, y0 = q.min(axis=0)
+    x1, y1 = q.max(axis=0)
+    pts = np.array([(x0, y0), (x1, y0), (x1, y1), (x0, y1)], np.float32)
+    if (y0 + y1) / 2 < ch / 2:
+        pts = pts[[2, 3, 0, 1]]
+    page = cv2.perspectiveTransform(pts.reshape(-1, 1, 2), np.linalg.inv(M)).reshape(-1, 2)
+    return [(round(float(x), 1), round(float(y), 1)) for x, y in page]
+
+
+def _search(crop: np.ndarray, valid: np.ndarray, sp: StampParams
+            ) -> tuple[Candidate, list[Candidate]] | None:
+    """The best stamp line and all readings at the level that found it, or None."""
     for i, level in enumerate(sp.mask_levels):
         # A bright stamp on a warm background can merge with its glow and surroundings into
         # blobs too big for digits: if nothing stamp-like was found, look again at stricter
@@ -159,18 +187,19 @@ def find_stamp(img_bgr: np.ndarray, corners: list[Point], outline: list[Point] |
         if i > 0:
             need = max(need, sp.fallback_min_score)  # (a second look must find a clear stamp)
         if best and best.score >= need:
-            break
-    else:
-        return None
+            return best, cands
+    return None
+
+
+def _settle(best: Candidate, cands: list[Candidate], sp: StampParams) -> Candidate:
+    """Drop dates whose digits are too damaged to trust, then vote over all readings."""
     for c in cands:
         worst = sp.dotted_max_digit_cost if c.dotted else sp.max_digit_cost
         if c.date and (_mean_cost(c) > sp.max_mean_cost or _worst_cost(c) > worst):
             # A stamp, but the digits are too damaged to trust the date: leave it for review.
             c.date_alts = [c.date] + c.date_alts
             c.date = None
-    best = _vote(best, cands)
-    return DateStamp(corners=_box_to_page(best, crop.shape[:2], M), text=best.text, date=best.date,
-                     date_alts=best.date_alts, score=round(best.score, 2))
+    return _vote(best, cands)
 
 
 def _vote(best: Candidate, cands: list[Candidate]) -> Candidate:
@@ -296,6 +325,19 @@ def rectify(img_bgr: np.ndarray, corners: list[Point], outline: list[Point] | No
     Returns (crop, M, valid) where M maps page -> crop coordinates and `valid` masks out the
     part of the print hidden under another one.
     """
+    src, M, (cw, ch), s = _crop_geometry(corners, sp)
+    crop = _warp(img_bgr, src, M, s, (cw, ch))
+    valid = np.full((ch, cw), 255, np.uint8)
+    if outline:
+        valid[:] = 0
+        poly = cv2.perspectiveTransform(np.asarray(outline, np.float32).reshape(-1, 1, 2), M)
+        cv2.fillPoly(valid, [np.round(poly).astype(np.int32)], 255)
+    return crop, M, valid
+
+
+def _crop_geometry(corners: list[Point], sp: StampParams
+                   ) -> tuple[np.ndarray, np.ndarray, tuple[int, int], float]:
+    """(src quad, M page -> crop, (crop w, h), scale) of the rectified crop."""
     q = np.asarray(corners, np.float32).reshape(4, 2)
     w = (np.linalg.norm(q[1] - q[0]) + np.linalg.norm(q[2] - q[3])) / 2
     h = (np.linalg.norm(q[3] - q[0]) + np.linalg.norm(q[2] - q[1])) / 2
@@ -315,13 +357,7 @@ def rectify(img_bgr: np.ndarray, corners: list[Point], outline: list[Point] | No
         cw, ch = max(1, round(h * s)), max(1, round(w * s))
         dst = np.array([(cw, 0), (cw, ch), (0, ch), (0, 0)], np.float32)
     M = cv2.getPerspectiveTransform(src, dst)
-    crop = _warp(img_bgr, src, M, s, (cw, ch))
-    valid = np.full((ch, cw), 255, np.uint8)
-    if outline:
-        valid[:] = 0
-        poly = cv2.perspectiveTransform(np.asarray(outline, np.float32).reshape(-1, 1, 2), M)
-        cv2.fillPoly(valid, [np.round(poly).astype(np.int32)], 255)
-    return crop, M, valid
+    return src, M, (cw, ch), s
 
 
 def _warp(img_bgr: np.ndarray, src: np.ndarray, M: np.ndarray, s: float, size: tuple[int, int]

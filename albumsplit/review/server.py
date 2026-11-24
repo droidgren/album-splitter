@@ -22,7 +22,7 @@ from fastapi.staticfiles import StaticFiles
 
 from ..imageio import IMAGE_EXTS, downscale, find_images, load_bgr
 from ..llm import DEFAULT_MODEL, MODELS
-from ..model import Page, assign_page_ids, date_source, derived_caption, derived_date
+from ..model import DateStamp, Page, assign_page_ids, date_source, derived_caption, derived_date
 from ..pipeline import (load_export_dir, load_guess_dates, load_input_dir, load_llm_model,
                         page_json_path, save_export_dir, save_guess_dates, save_input_dir,
                         save_llm_model)
@@ -538,6 +538,29 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
                 page.save(path)
         return with_derived(page, stamp_result={"found": ans.found, "text": ans.text, "date": ans.date,
                                                 "model": ans.model})
+
+    @app.post("/api/pages/{page_id}/photos/{photo_id}/stamp_box")
+    def mark_stamp(page_id: str, photo_id: int, body: dict = Body(...)) -> dict:
+        """The reviewer marked where the date stamp of a photo is. Only the box is kept (turned
+        to reading direction), unread: Claude reads it ("Read stamp with Claude" or the page
+        request). The OCR is not run again, it already searched there in detection."""
+        from ..stamp import orient_box
+        try:
+            box = [(float(x), float(y)) for x, y in body["box"]]
+        except (KeyError, TypeError, ValueError) as e:
+            raise HTTPException(422, f"bad box: {e}") from e
+        if len(box) != 4:
+            raise HTTPException(422, "box needs 4 points")
+        path = json_path(page_id)
+        with lock:
+            page = Page.load(path)
+            photo = next((p for p in page.photos if p.id == photo_id), None)
+            if photo is None:
+                raise HTTPException(404, f"no photo {photo_id} on {page_id}")
+            photo.stamp = DateStamp(corners=orient_box(photo.corners, box), manual=True)
+            page.edited = True
+            page.save(path)
+        return with_derived(page)
 
     @app.get("/api/pages/{page_id}/image")
     def page_image(page_id: str) -> FileResponse:

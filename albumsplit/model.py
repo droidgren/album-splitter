@@ -24,12 +24,14 @@ class DateStamp:
     date_alts: list[str] = field(default_factory=list)  # nearly as likely readings, for review
     score: float = 0.0
     reader: str = "ocr"  # or "llm:<model>" once Claude has read it in review
+    manual: bool = False  # the box was marked in review (not read by the OCR)
 
     @classmethod
     def from_dict(cls, d: dict) -> DateStamp:
         return cls(corners=[tuple(c) for c in d["corners"]], text=d.get("text"),
                    date=d.get("date"), date_alts=list(d.get("date_alts", [])),
-                   score=d.get("score", 0.0), reader=d.get("reader", "ocr"))
+                   score=d.get("score", 0.0), reader=d.get("reader", "ocr"),
+                   manual=d.get("manual", False))
 
 
 @dataclass

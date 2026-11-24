@@ -336,3 +336,16 @@ def test_noisy_high_resolution_scan():
     big = np.clip(big, 0, 255).astype(np.uint8)
     st = find_stamp(big, [(x * f, y * f) for x, y in corners])
     assert st is not None and st.date == "1992-05-12"
+
+
+def test_marked_box_turns_to_reading_direction():
+    """A box marked in review keeps its place; it reads left to right in the bottom half of the
+    landscape print and upside down in the top half."""
+    from albumsplit.stamp import orient_box
+    x, y, w, h = PRINT
+    corners = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+    bottom = [(x + 1000, y + 900), (x + 1300, y + 900), (x + 1300, y + 960), (x + 1000, y + 960)]
+    rounded = lambda pts: [tuple(round(v) for v in pt) for pt in pts]  # noqa: E731
+    assert rounded(orient_box(corners, bottom)) == bottom
+    top = [(x + 100, y + 50), (x + 400, y + 50), (x + 400, y + 120), (x + 100, y + 120)]
+    assert rounded(orient_box(corners, top)) == top[2:] + top[:2]

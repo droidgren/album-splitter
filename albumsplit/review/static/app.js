@@ -24,6 +24,7 @@ const S = {
   version: 0, savedVersion: 0, saveTimer: null, saving: null, saveError: false,
   space: false,
   busy: false,               // waiting for Claude: edits are blocked, its answer replaces the page
+  stampFor: null,            // photo id whose date stamp the next drag marks (S / "Mark stamp")
   flaggedOnly: localStorage.getItem("albumsplit.flaggedOnly") === "1",  // navigate flagged pages only
 };
 
@@ -108,7 +109,7 @@ async function go(i) {
     api(`/api/pages/${encodeURIComponent(pid)}`),
     loadImage(imageUrl(pid)).catch((e) => { console.error(e); return null; }),
   ]);
-  S.idx = i; S.page = page; S.img = img; S.sel = null; S.undo = []; S.drag = null;
+  S.idx = i; S.page = page; S.img = img; S.sel = null; S.undo = []; S.drag = null; S.stampFor = null;
   S.version = S.savedVersion = 0;
   history.replaceState(null, "", "#" + encodeURIComponent(pid));
   fit(); renderBar(); renderPanel(); draw();
@@ -260,6 +261,14 @@ function hitItem(x, y) {
   return null;
 }
 
+// The smallest photo under a point (texts ignored), or null.
+function photoAt(x, y) {
+  const hits = S.page.photos.filter((p) => pointInPoly(x, y, p.corners));
+  const area = (p) => { const [x0, y0, x1, y1] = bbox(p.corners); return (x1 - x0) * (y1 - y0); };
+  hits.sort((a, b) => area(a) - area(b));
+  return hits.length ? hits[0] : null;
+}
+
 function bbox(pts) {
   const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
   return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
@@ -324,7 +333,7 @@ function draw() {
       poly(p.corners, { stroke: c, width: (sel ? 5 : 3) * px });
     }
     if (p.stamp) {
-      poly(p.stamp.corners, { stroke: c, width: 1.5 * px });
+      poly(p.stamp.corners, { stroke: c, width: 1.5 * px, dash: p.stamp.manual ? [4 * px, 3 * px] : null });
       const [sx0, sy0] = bbox(p.stamp.corners);
       label(`${p.stamp.text || "?"} = ${p.stamp.date || "?"}`, sx0, sy0 - 4 * px, c, 12 * px, "bottom");
     }
@@ -356,7 +365,8 @@ function draw() {
   const d = S.drag;
   if (d && d.mode === "create" && d.active) {
     const [x0, y0, x1, y1] = [Math.min(d.x0, d.x), Math.min(d.y0, d.y), Math.max(d.x0, d.x), Math.max(d.y0, d.y)];
-    poly([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], { stroke: d.photo ? "#000" : "#555", width: 2 * px, dash: [6 * px, 4 * px] });
+    const color = d.stamp ? colorOf(d.stamp) : d.photo ? "#000" : "#555";
+    poly([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], { stroke: color, width: 2 * px, dash: [6 * px, 4 * px] });
   }
 }
 
@@ -410,7 +420,12 @@ canvas.addEventListener("pointerdown", (e) => {
   if (e.button !== 0) return;
   const h = hitHandle(sx, sy);
   const base = { sx, sy, x0: x, y0: y, x, y, active: false, shift: e.shiftKey, ctrl: e.ctrlKey || e.metaKey, before: clone(S.page) };
-  if (h >= 0) S.drag = { ...base, mode: "handle", handle: h };
+  if (S.stampFor !== null || e.altKey) {
+    // Mark a date stamp: for the photo picked with S / "Mark stamp", or the one under Alt+drag.
+    const p = S.stampFor !== null ? photoById(S.stampFor) : photoAt(x, y);
+    if (!p) { hint("Alt+drag inside a photo to mark its date stamp."); S.drag = null; return; }
+    S.drag = { ...base, mode: "create", stamp: p.id };
+  } else if (h >= 0) S.drag = { ...base, mode: "handle", handle: h };
   else if (e.shiftKey) S.drag = { ...base, mode: "create", photo: true };
   else if (insideSelected(x, y)) S.drag = { ...base, mode: "move" };
   else {
@@ -442,7 +457,10 @@ canvas.addEventListener("pointerup", (e) => {
   const d = S.drag;
   S.drag = null;
   if (!d || d.mode === "pan") return;
-  if (!d.active) { click(d.x0, d.y0, d.ctrl); return; }
+  if (!d.active) {
+    if (d.stamp) { hint(`Drag a box around the date stamp of photo ${d.stamp} (Esc cancels).`); return; }
+    click(d.x0, d.y0, d.ctrl); return;
+  }
   if (d.mode === "create") { createBox(d); return; }
   // handle/move: geometry was edited live; record one undo step for the whole drag.
   S.undo.push(d.before);
@@ -452,7 +470,7 @@ canvas.addEventListener("pointerup", (e) => {
 function updateCursor(sx, sy) {
   if (!S.page) return;
   const [x, y] = toPage(sx, sy);
-  canvas.style.cursor = S.space ? "grab" : hitHandle(sx, sy) >= 0 ? "move"
+  canvas.style.cursor = S.space ? "grab" : S.stampFor !== null ? "crosshair" : hitHandle(sx, sy) >= 0 ? "move"
     : insideSelected(x, y) ? "move" : hitItem(x, y) ? "pointer" : "crosshair";
 }
 
@@ -518,6 +536,7 @@ function createBox(d) {
   const x0 = clampX(Math.min(d.x0, d.x)), y0 = clampY(Math.min(d.y0, d.y));
   const x1 = clampX(Math.max(d.x0, d.x)), y1 = clampY(Math.max(d.y0, d.y));
   if (x1 - x0 < 4 || y1 - y0 < 4) { draw(); return; }
+  if (d.stamp) { markStamp(d.stamp, [[r1(x0), r1(y0)], [r1(x1), r1(y0)], [r1(x1), r1(y1)], [r1(x0), r1(y1)]]); return; }
   mutate(() => {
     if (d.photo) {
       const id = Math.max(0, ...S.page.photos.map((p) => p.id)) + 1;
@@ -594,6 +613,7 @@ document.addEventListener("keydown", (e) => {
     return;
   }
   if (e.key === " ") { S.space = true; canvas.style.cursor = "grab"; e.preventDefault(); return; }
+  if (e.key === "Alt") { e.preventDefault(); return; }  // (Alt+drag marks a stamp; keep the browser menu shut)
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") { undo(); e.preventDefault(); return; }
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   switch (e.key) {
@@ -608,10 +628,11 @@ document.addEventListener("keydown", (e) => {
     case "f": case "F": toggleFlagged(); break;
     case "u": case "U": setStatus("proposed"); break;
     case "l": case "L": askPage(); break;
+    case "s": case "S": startStampMode(); break;
     case "r": rotateSelected(90); break;
     case "R": rotateSelected(-90); break;
     case "Delete": case "Backspace": deleteSelected(); break;
-    case "Escape": select(null); break;
+    case "Escape": if (S.stampFor !== null) { S.stampFor = null; hint(""); renderPanel(); draw(); } else select(null); break;
     case "0": fit(); draw(); break;
     default: return;
   }
@@ -667,14 +688,15 @@ $("ask").addEventListener("click", () => askPage());
 
 // Run one request to Claude for the current page. The server saves the answer; the page
 // then becomes the answer, with the previous state kept for Ctrl+Z.
-async function withClaude(label, url, done) {
+async function withClaude(label, url, done, body = null) {
   if (S.busy || !S.page) return;
   await flushSave();
   if (S.saveError) return;
   const pid = S.page.page_id;
   S.busy = true; setBusy(label);
   try {
-    const saved = await api(url, { method: "POST" });
+    const saved = await api(url, body === null ? { method: "POST" }
+      : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     if (S.page && S.page.page_id === pid) {
       S.undo.push(clone(S.page));
       S.page = saved;
@@ -721,6 +743,28 @@ function askStamp(photoId) {
     if (!r.found) return `${modelName(r.model)} sees no date stamp on photo ${photoId}.`;
     return `Photo ${photoId}: stamp "${r.text}" = ${r.date || "date unclear"} (${modelName(r.model)})`;
   });
+}
+
+function startStampMode(photoId) {
+  if (S.busy) { hint("Wait for Claude's answer…"); return; }
+  const id = photoId ?? (S.sel && S.sel.kind === "photo" ? S.sel.id : null);
+  if (id === null) { hint("Select a photo first (or Alt+drag inside a photo) to mark its date stamp."); return; }
+  S.stampFor = id;
+  select({ kind: "photo", id });
+  hint(`Drag a box around the date stamp of photo ${id} (Esc cancels).`);
+}
+
+// The box becomes the photo's stamp, unread: Claude reads it (its button, or L for the page).
+function markStamp(photoId, box) {
+  S.stampFor = null;
+  const pid = encodeURIComponent(S.page.page_id);
+  withClaude(`Marking the date stamp of photo ${photoId}…`, `/api/pages/${pid}/photos/${photoId}/stamp_box`,
+    () => `Photo ${photoId}: stamp marked - "Read stamp with Claude" reads it (Ctrl+Z undoes)`, { box });
+}
+
+function removeStamp(photoId) {
+  mutate(() => { photoById(photoId).stamp = null; });
+  hint(`Photo ${photoId}: date stamp removed (Ctrl+Z undoes)`);
 }
 
 function el(tag, attrs = {}, ...kids) {
@@ -794,16 +838,22 @@ function renderPanel() {
         onSet: (v, now) => setPhotoField(p.id, "date", v, now) }));
     const stampBtn = el("button", { class: "ask", disabled: S.busy, title: "Ask Claude to read the date the camera printed into this photo",
       onclick: () => askStamp(p.id) }, "Read stamp with Claude");
+    const markBtn = el("button", { class: "ask", disabled: S.busy,
+      title: "Drag a box around the date stamp, for Claude to read (S, or Alt+drag on the photo)",
+      onclick: () => startStampMode(p.id) }, S.stampFor === p.id ? "Drag on the photo…" : p.stamp ? "Re-mark" : "Mark stamp");
     if (p.stamp) {
       const st = p.stamp, cur = p.date ?? p.derived_date;
-      const by = st.reader && st.reader.startsWith("llm") ? " (Claude)" : "";
-      card.append(el("div", { class: "chips" }, `Stamp "${st.text || "?"}"${by}: `,
+      const by = st.reader && st.reader.startsWith("llm") ? " (Claude)" : st.manual ? " (marked)" : "";
+      const head = st.manual && !st.text ? `Stamp${by}: ` : `Stamp "${st.text || "?"}"${by}: `;
+      card.append(el("div", { class: "chips" }, head,
         [st.date, ...(st.date_alts || [])].filter(Boolean).map((d) =>
           el("span", { class: "chip" + (d === cur ? " on" : ""), title: "Use this date",
             onclick: () => setPhotoField(p.id, "date", d, true) }, d)),
-        st.date ? null : el("span", { class: "muted" }, "unread "), stampBtn));
+        st.date ? null : el("span", { class: "muted" }, "unread "), stampBtn, markBtn,
+        el("button", { class: "ask", disabled: S.busy, title: "Not a date stamp: remove the stamp box",
+          onclick: () => removeStamp(p.id) }, "×")));
     } else {
-      card.append(el("div", { class: "chips" }, el("span", { class: "muted" }, "No date stamp found "), stampBtn));
+      card.append(el("div", { class: "chips" }, el("span", { class: "muted" }, "No date stamp found "), stampBtn, markBtn));
     }
     if (p.date_guess) {
       const g = p.date_guess, cur = p.date ?? p.derived_date;
