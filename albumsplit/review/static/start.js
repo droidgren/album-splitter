@@ -175,8 +175,10 @@ function redetectAll() {
   const lines = [`Detect all ${s.scans ?? ""} scans again from scratch?`];
   if (reviewed) lines.push("", `${reviewed} page${reviewed === 1 ? "" : "s"} you approved or edited `
     + "will lose your changes (frames, links, captions, dates) and go back to unreviewed.");
-  if ($("opt-llm").checked) lines.push("", `Claude (${$("llm-model").selectedOptions[0].text}) reads every page again`
-    + (llmMode() === "batch" ? " as a batch, at half price." : ", at full price."));
+  if ($("opt-llm").checked) lines.push("", `Claude (${$("llm-model").selectedOptions[0].text}) is asked about every page`
+    + (llmMode() === "batch" ? " as a batch, at half price." : ", at full price.")
+    + " A page that detects the same as last time, with the same model, is answered from the cache"
+    + " for free, so this costs little unless detection or the model has changed.");
   if (confirm(lines.join("\n"))) startDetect(true);
 }
 
