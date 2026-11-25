@@ -26,6 +26,7 @@ from ..model import DateStamp, Page, assign_page_ids, date_source, derived_capti
 from ..pipeline import (load_export_dir, load_guess_dates, load_input_dir, load_llm_model,
                         page_json_path, save_export_dir, save_guess_dates, save_input_dir,
                         save_llm_model)
+from ..version import build_info, version_string
 from .geometry import normalize
 from .jobs import DetectJob, ExportJob
 
@@ -183,6 +184,10 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
                        guess_dates=load_guess_dates(st["work"]),
                        export_dir=str(load_export_dir(st["work"]) or st["work"] / "export"))
         return out
+
+    @app.get("/api/version")
+    def get_version() -> dict:
+        return {**build_info(), "text": version_string()}
 
     @app.get("/api/project")
     def get_project() -> dict:

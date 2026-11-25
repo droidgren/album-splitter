@@ -5,18 +5,22 @@
 #     /share/<Folder>/... is how QNAP shared folders appear (File Station shows the names).
 #     The work and export folders must not be inside the scan folder; create them first.
 #  2. Optional: put your Anthropic API key in ANTHROPIC_API_KEY to use Claude.
-#  3. The image is private while the GitHub repo is: in Container Station add the registry
-#     ghcr.io (Settings -> Registry) with your GitHub user name and a personal access token
-#     with the read:packages scope. (Or make the package public on GitHub.)
+#  3. The image is public on ghcr.io, so no registry login is needed. (If it is ever made
+#     private again, "pull_policy: always" needs a "docker login ghcr.io" over SSH: Container
+#     Station's own registry login is not used by the compose pull.)
 #
 # Then open http://<nas-ip>:8000/ . On the start page pick /scans as the scan folder and
-# /work as the work folder; export to /export.
+# /work as the work folder; export to /export. The running version (commit and date) is shown
+# at the top right of the start page and in the container log.
 
 services:
   albumsplit:
     image: ghcr.io/droidgren/album-splitter:latest
+    # Pull :latest on every recreate/up, so recreating the application in Container
+    # Station picks up a newly pushed image instead of reusing the cached one.
+    pull_policy: always
     # To build on the NAS instead of pulling: copy the repository to the NAS, remove the
-    # "image" line above and uncomment these two lines (use the folder you copied it to).
+    # "image" and "pull_policy" lines above and uncomment these two lines (use the folder you copied it to).
     # build:
     #   context: /share/Container/album-splitter
     container_name: albumsplit

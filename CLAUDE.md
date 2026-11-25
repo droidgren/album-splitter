@@ -170,7 +170,13 @@ Implemented in `export.py` + `exiftool.py`. Notes:
 - Should also run in Docker (target: QNAP NAS); keep a `Dockerfile` working.
   `docker-compose.yml` is the QNAP Container Station application (start page on port 8000,
   volumes `/scans` read-only, `/work`, `/export`, `/config` = `$HOME` for the recent list).
-  `.github/workflows/docker.yml` pushes an amd64 image to `ghcr.io/droidgren/album-splitter`.
+  `.github/workflows/docker.yml` pushes an amd64 image to `ghcr.io/droidgren/album-splitter`
+  (public, so `pull_policy: always` needs no login).
+- Version (`version.py`): `__version__` plus the git commit and its date, e.g.
+  `0.1.0+a90198b (2026-11-24)` (`.dirty` with uncommitted changes). Docker has no `.git`, so the
+  workflow passes `ALBUMSPLIT_COMMIT` / `ALBUMSPLIT_COMMIT_DATE` as build args. Shown by
+  `albumsplit --version`, the `review` startup line (container log), `/api/version`, and in the
+  corner of the start and review pages.
 
 ## First milestone
 Detection + heuristic linking on the samples, plus a debug image per page with boxes and

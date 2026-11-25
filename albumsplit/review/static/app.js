@@ -912,3 +912,10 @@ function setTextField(tid, field, value) {
 }
 
 init().catch((e) => { console.error(e); hint("Failed to load: " + e.message); });
+
+// Build shown in the corner, so it is clear which version runs (e.g. on the NAS).
+fetch("/api/version").then((r) => r.json()).then((v) => {
+  const el = document.getElementById("version");
+  el.textContent = "albumsplit " + v.text;
+  el.title = v.commit ? `commit ${v.commit}${v.dirty ? " with uncommitted changes" : ""}` : "commit unknown";
+}).catch(() => {});

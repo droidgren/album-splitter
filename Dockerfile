@@ -9,6 +9,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY albumsplit/ albumsplit/
 
+# The commit this image was built from, shown by --version and in the web UI (no .git here).
+# The GitHub workflow passes them; a local "docker build" leaves them empty (plain version).
+ARG ALBUMSPLIT_COMMIT=""
+ARG ALBUMSPLIT_COMMIT_DATE=""
+ENV ALBUMSPLIT_COMMIT=$ALBUMSPLIT_COMMIT ALBUMSPLIT_COMMIT_DATE=$ALBUMSPLIT_COMMIT_DATE
+
 # The start page keeps its recent-projects list in $HOME/.albumsplit; mount /config to keep it.
 ENV HOME=/config PYTHONUNBUFFERED=1
 RUN mkdir -p /config /scans /work /export

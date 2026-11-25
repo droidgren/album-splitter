@@ -664,3 +664,9 @@ def test_claude_only_batch_updates_edited_pages(env, monkeypatch):
     after = Page.load(page_json_path(work, "p1"))
     assert sorted((lk.text_id, lk.photo_id) for lk in after.links) == [(1, 1), (2, 2), (3, 2)]
     assert after.texts[0].transcription == "Påsk" and after.texts[2].date == "1990"
+
+
+def test_version_endpoint(tmp_path):
+    client = TestClient(create_app(config_dir=tmp_path / "cfg"))
+    v = client.get("/api/version").json()
+    assert v["text"].startswith(v["version"])

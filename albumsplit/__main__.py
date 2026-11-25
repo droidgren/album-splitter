@@ -197,7 +197,8 @@ def cmd_review(args: argparse.Namespace) -> int:
     # Straight into review when the project is known, else the start page to choose one.
     url = base + ("/review" if work_dir and input_dir and (work_dir / "pages").is_dir() else "/")
     where = f"{work_dir} (scans in {input_dir})" if work_dir and input_dir else "start page"
-    print(f"albumsplit: {where} at {base}/  - Ctrl+C stops")
+    from .version import version_string
+    print(f"albumsplit {version_string()}: {where} at {base}/  - Ctrl+C stops")
     if args.open if args.open is not None else args.host != "0.0.0.0":
         import threading
         import webbrowser
@@ -246,7 +247,10 @@ def cmd_export(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from .version import version_string
+
     ap = argparse.ArgumentParser(prog="albumsplit")
+    ap.add_argument("--version", action="version", version=f"albumsplit {version_string()}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     d = sub.add_parser("detect", help="detect photos and text blocks, link them heuristically")

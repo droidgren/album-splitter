@@ -395,3 +395,10 @@ $("export-cancel").addEventListener("click", () => post("/api/export/cancel").th
 $("opt-all").addEventListener("change", () => api("/api/project").then((p) => p.stats && updateExportButton(p.stats)));
 
 init().catch((e) => msg("open-msg", "Failed to load: " + e.message, true));
+
+// Build shown in the corner, so it is clear which version runs (e.g. on the NAS).
+fetch("/api/version").then((r) => r.json()).then((v) => {
+  const el = document.getElementById("version");
+  el.textContent = "albumsplit " + v.text;
+  el.title = v.commit ? `commit ${v.commit}${v.dirty ? " with uncommitted changes" : ""}` : "commit unknown";
+}).catch(() => {});
