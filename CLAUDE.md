@@ -91,6 +91,11 @@ Implemented in `albumsplit/review/` (vanilla JS, no build step/CDN). Notes:
 - Claude model: chosen per project on the start page (`llm.MODELS`, saved as `llm_model` in
   `workdir.json`; the CLI's `--llm-model` is the default). Used for detection, L and stamp reads.
   Only models in `llm.FALLBACK_MODELS` get the server-side refusal fallback (Haiku has none).
+- Effort: chosen next to the model (`llm.EFFORTS`, saved as `llm_effort` in `workdir.json`, CLI
+  `--llm-effort`; none = the model's default). Sent as `output_config.effort`; lower effort means
+  less thinking, which is most of the output cost. Cache keys use `LlmLinker.tag` (`model@effort`,
+  plain model id at the default, so old caches stay valid); batches record their `effort`.
+  Cache files keep the response's token `usage`, so a project's real cost can be measured.
 - Detect with Claude has two modes: **Batch** (default; Message Batches API, half price; pages are
   saved with heuristic links at once, the start page polls `/api/batches` every minute and applies
   answers when a batch ends) and **Now** (direct calls). Batch results never overwrite pages that

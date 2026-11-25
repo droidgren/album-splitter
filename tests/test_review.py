@@ -218,8 +218,8 @@ def test_detect_job_runs_in_background(tmp_path: Path):
 class FakeLinker:
     calls: list = []
 
-    def __init__(self, model):
-        self.model = model
+    def __init__(self, model, effort=None):
+        self.model, self.effort, self.tag = model, effort, model
 
     def link(self, page, img, cache_dir, *, force=False):
         from albumsplit.llm import LlmResult, TextAnswer
@@ -311,7 +311,7 @@ def test_claude_unavailable_is_503(env, monkeypatch):
     client, _, _ = env
     from albumsplit.llm import LlmUnavailable
 
-    def broken(model):
+    def broken(model, effort=None):
         raise LlmUnavailable("no Anthropic credentials found: set ANTHROPIC_API_KEY")
     monkeypatch.setattr("albumsplit.llm.LlmLinker", broken)
     r = client.post("/api/pages/p1/llm")
@@ -478,8 +478,8 @@ def _fake_batch_linker():
     class FakeBatchLinker(LlmLinker):
         models: list = []
 
-        def __init__(self, model):  # no network: only the Batch API is used, and it is fake
-            self.model = model
+        def __init__(self, model, effort=None):  # no network: only the Batch API is used, and it is fake
+            self.model, self.effort = model, effort
             self._anthropic = None
             self.client = NS(messages=NS(batches=FakeBatches()))
             FakeBatchLinker.models.append(model)
@@ -513,7 +513,7 @@ def test_haiku_is_called_without_refusal_fallback():
         return NS(stop_reason="end_turn", content=[NS(type="text", text='{"texts": [], "issues": []}')])
     for model, has_fallback in (("claude-haiku-5-5", False), ("claude-opus-5-5", True)):
         llm = LlmLinker.__new__(LlmLinker)
-        llm.model, llm._anthropic = model, NS(APIStatusError=OSError, APIConnectionError=OSError)
+        llm.model, llm.effort, llm._anthropic = model, None, NS(APIStatusError=OSError, APIConnectionError=OSError)
         llm.client = NS(beta=NS(messages=NS(create=create)))
         assert llm._call("p", [{"type": "text", "text": "x"}]) == {"texts": [], "issues": []}
         assert ("fallbacks" in sent[-1]) == has_fallback and sent[-1]["model"] == model

@@ -93,7 +93,7 @@ def test_stamp_answers_only_for_photos_that_were_asked():
 
 def test_request_carries_a_closeup_of_each_stamp():
     linker = LlmLinker.__new__(LlmLinker)  # no network: prepare() only builds the request
-    linker.model = "m"
+    linker.model, linker.effort = "m", None
     page = _page(_stamp("6 5 '95", "1995-05-06"), None, _stamp("98 8 9", None, ["1998-08-09"]))
     img = np.full((200, 500, 3), 200, np.uint8)
     req = linker.prepare(page, img)
@@ -122,7 +122,7 @@ def test_stamp_request_without_a_box_sends_corner_closeups():
     portrait = dict(stamp_corners(img, quad(100, 100, 800, 1100)))
     assert portrait["bottom right"].shape[1] > portrait["bottom right"].shape[0]
     linker = LlmLinker.__new__(LlmLinker)
-    linker.model = "m"
+    linker.model, linker.effort = "m", None
     page = Page(page_id="p", source="p.png", width=1600, height=1200,
                 photos=[Photo(id=1, corners=corners)])
     content, _ = linker.prepare_stamp(page, page.photos[0], img)
@@ -138,7 +138,37 @@ def test_marked_stamp_takes_claudes_reading_unflagged():
     assert ph.stamp.date == "1993-05-08" and ph.stamp.text == "8 5 '93"
     assert ph.stamp.reader == "llm:m" and not ph.needs_review and not page.issues
     linker = LlmLinker.__new__(LlmLinker)
-    linker.model = "m"
+    linker.model, linker.effort = "m", None
     req = linker.prepare(_page(DateStamp(corners=quad(0, 40, 30, 50), manual=True)),
                          np.full((200, 500, 3), 200, np.uint8))
     assert "P1: date stamp S1, marked in review, not read yet" in req.content[-1]["text"]
+
+
+def test_effort_is_sent_and_keys_the_cache():
+    """Answers at another effort are other answers; the model's default keeps the old keys."""
+    page = _page(_stamp("6 5 '95", "1995-05-06"))
+    img = np.full((200, 500, 3), 200, np.uint8)
+    linker = LlmLinker.__new__(LlmLinker)
+    linker.model, linker.effort = "m", None
+    plain = linker.prepare(page, img)
+    assert "effort" not in linker.params(plain.content)["output_config"]
+    linker.effort = "low"
+    low = linker.prepare(page, img)
+    assert linker.params(low.content)["output_config"]["effort"] == "low"
+    assert linker.tag == "m@low" and low.digest != plain.digest
+
+
+def test_cache_keeps_token_usage_beside_the_answer(tmp_path):
+    import json
+    from types import SimpleNamespace
+
+    from albumsplit.llm import parse_message, read_cache, write_cache
+    msg = SimpleNamespace(stop_reason="end_turn", content=[SimpleNamespace(type="text", text='{"a": 1}')],
+                          usage=SimpleNamespace(input_tokens=5000, output_tokens=900,
+                                                cache_read_input_tokens=0))
+    data = parse_message("p", msg)
+    write_cache(tmp_path / "p.json", "h", "m", data, "low")
+    stored = json.loads((tmp_path / "p.json").read_text(encoding="utf-8"))
+    assert stored["usage"] == {"input_tokens": 5000, "output_tokens": 900,
+                               "cache_read_input_tokens": 0}
+    assert stored["effort"] == "low" and read_cache(tmp_path / "p.json", "h") == {"a": 1}

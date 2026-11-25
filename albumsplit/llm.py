@@ -36,6 +36,10 @@ MODELS = [
 # Models with a server-side refusal fallback (`fallbacks="default"`); Haiku has none.
 FALLBACK_MODELS = {"claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5",
                    "claude-fable-5-2", "claude-fable-5-1"}
+# Effort levels offered on the start page (`output_config.effort`). None = the model's default
+# (medium on Opus 5.5 and Haiku 5.5, high on Sonnet 5.5 and Fable). Lower effort means less
+# thinking, which is most of the output tokens and so most of the cost.
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
 ISSUE_KINDS = ("missed_caption", "missed_photo", "merged_photos", "bad_frame", "other")
 PROMPT_VERSION = 3  # bump when the prompt or schema changes, invalidates the cache
 PAGE_LONG_SIDE = 1568
@@ -238,7 +242,10 @@ def _partial(s: str) -> str | None:
 
 
 class LlmLinker:
-    def __init__(self, model: str = DEFAULT_MODEL) -> None:
+    def __init__(self, model: str = DEFAULT_MODEL, effort: str | None = None) -> None:
+        if effort is not None and effort not in EFFORTS:
+            raise LlmUnavailable(f"Unknown effort {effort!r}: use one of {', '.join(EFFORTS)}")
+        self.effort = effort
         try:
             import anthropic
         except ImportError as e:
@@ -258,6 +265,12 @@ class LlmLinker:
         except (anthropic.AnthropicError, TypeError) as e:  # TypeError: no credentials at all
             raise LlmUnavailable("no Anthropic credentials found: set ANTHROPIC_API_KEY") from e
 
+    @property
+    def tag(self) -> str:
+        """Model plus effort, as hashed into cache keys: answers at another effort are other
+        answers. The model's default effort keeps the plain model id (and older caches)."""
+        return self.model if self.effort is None else f"{self.model}@{self.effort}"
+
     def link(self, page: Page, img_bgr: np.ndarray, cache_dir: Path, *, force: bool = False
              ) -> LlmResult | None:
         """Ask Claude about this page. None (with a warning) if no usable answer came back.
@@ -271,7 +284,7 @@ class LlmLinker:
             data = self._call(page.page_id, req.content)
             if data is None:
                 return None
-            write_cache(cache_path, req.digest, self.model, data)
+            write_cache(cache_path, req.digest, self.model, data, self.effort)
         return self.result(page, data, cached=cached)
 
     def cached(self, page: Page, img_bgr: np.ndarray, cache_dir: Path
@@ -288,7 +301,7 @@ class LlmLinker:
 
     def prepare(self, page: Page, img_bgr: np.ndarray) -> Request:
         h = hashlib.sha256()
-        h.update(f"{self.model}|{PROMPT_VERSION}|".encode())
+        h.update(f"{self.tag}|{PROMPT_VERSION}|".encode())
         h.update(json.dumps(SCHEMA, sort_keys=True).encode())
         overview = _encode(render_overview(page, img_bgr))
         h.update(overview)
@@ -327,12 +340,15 @@ class LlmLinker:
     def params(self, content: list[dict], system: str = SYSTEM_PROMPT,
                schema: dict[str, Any] = SCHEMA) -> dict:
         """Messages API parameters shared by the direct call and the Batch API."""
+        output: dict[str, Any] = {"format": {"type": "json_schema", "schema": schema}}
+        if self.effort is not None:
+            output["effort"] = self.effort
         return {
             "model": self.model,
             "max_tokens": 16000,
             "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
             "messages": [{"role": "user", "content": content}],
-            "output_config": {"format": {"type": "json_schema", "schema": schema}},
+            "output_config": output,
         }
 
     def read_stamp(self, page: Page, photo: Photo, img_bgr: np.ndarray, cache_dir: Path, *,
@@ -346,7 +362,7 @@ class LlmLinker:
             data = self._call(page.page_id, content, STAMP_SYSTEM_PROMPT, STAMP_SCHEMA)
             if data is None:
                 return None
-            write_cache(cache_path, digest, self.model, data)
+            write_cache(cache_path, digest, self.model, data, self.effort)
         found = bool(data.get("found"))
         return StampAnswer(found=found, text=(data.get("text") or "").strip() if found else "",
                            date=normalize_date(data.get("date")) if found else None,
@@ -356,7 +372,7 @@ class LlmLinker:
                       ) -> tuple[list[dict], str]:
         """Content blocks for a stamp read, plus a hash of everything sent (the cache key)."""
         h = hashlib.sha256()
-        h.update(f"{self.model}|stamp{STAMP_PROMPT_VERSION}|".encode())
+        h.update(f"{self.tag}|stamp{STAMP_PROMPT_VERSION}|".encode())
         h.update(json.dumps(STAMP_SCHEMA, sort_keys=True).encode())
         whole = _encode(downscale(warp_quad(img_bgr, photo.corners), PAGE_LONG_SIDE)[0])
         h.update(whole)
@@ -422,17 +438,41 @@ def parse_message(page_id: str, msg) -> dict | None:
         return None
     text = next((b.text for b in msg.content if b.type == "text"), None)
     try:
-        return json.loads(text) if text else None
+        data = json.loads(text) if text else None
     except json.JSONDecodeError:
         _warn(page_id, "answer was not valid JSON")
         return None
+    if isinstance(data, dict) and (usage := usage_of(msg)):
+        data[USAGE_KEY] = usage
+    return data
 
 
-def write_cache(path: Path, digest: str, model: str, data: dict) -> None:
+USAGE_KEY = "_usage"  # set by parse_message, moved out of the answer by write_cache
+
+
+def usage_of(msg) -> dict | None:
+    """Token counts of a response, stored in the cache so a project's cost can be measured."""
+    u = getattr(msg, "usage", None)
+    if u is None:
+        return None
+    keys = ("input_tokens", "output_tokens", "cache_creation_input_tokens",
+            "cache_read_input_tokens")
+    return {k: v for k in keys if isinstance(v := getattr(u, k, None), int)}
+
+
+def write_cache(path: Path, digest: str, model: str, data: dict,
+                effort: str | None = None) -> None:
+    """Store an answer. Token usage that parse_message attached is kept beside it."""
+    usage = data.pop(USAGE_KEY, None)
+    entry: dict[str, Any] = {"hash": digest, "model": model}
+    if effort is not None:
+        entry["effort"] = effort
+    if usage:
+        entry["usage"] = usage
+    entry["response"] = data
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps({"hash": digest, "model": model, "response": data},
-                              indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.write_text(json.dumps(entry, indent=2, ensure_ascii=False), encoding="utf-8")
     tmp.replace(path)
 
 

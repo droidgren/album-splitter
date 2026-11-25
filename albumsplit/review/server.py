@@ -21,11 +21,11 @@ from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..imageio import IMAGE_EXTS, downscale, find_images, load_bgr
-from ..llm import DEFAULT_MODEL, MODELS
+from ..llm import DEFAULT_MODEL, EFFORTS, MODELS
 from ..model import DateStamp, Page, assign_page_ids, date_source, derived_caption, derived_date
-from ..pipeline import (load_export_dir, load_guess_dates, load_input_dir, load_llm_model,
-                        page_json_path, save_export_dir, save_guess_dates, save_input_dir,
-                        save_llm_model)
+from ..pipeline import (load_export_dir, load_guess_dates, load_input_dir, load_llm_effort,
+                        load_llm_model, page_json_path, save_export_dir, save_guess_dates, save_input_dir,
+                        save_llm_effort, save_llm_model)
 from ..version import build_info, version_string
 from .geometry import normalize
 from .jobs import DetectJob, ExportJob
@@ -61,7 +61,8 @@ def _inside(child: Path, parent: Path) -> bool:
 
 
 def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
-               llm_model: str = DEFAULT_MODEL, config_dir: Path | None = None) -> FastAPI:
+               llm_model: str = DEFAULT_MODEL, llm_effort: str | None = None,
+               config_dir: Path | None = None) -> FastAPI:
     app = FastAPI(title="albumsplit", docs_url=None, redoc_url=None)
     config_dir = config_dir or default_config_dir()
     lock = threading.Lock()          # page JSON writes
@@ -155,6 +156,11 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
         chosen = load_llm_model(st["work"]) if st["work"] is not None else None
         return chosen if chosen in model_ids else llm_model
 
+    def current_effort() -> str | None:
+        """The project's effort level; None = the model's default (also the CLI default)."""
+        chosen = load_llm_effort(st["work"]) if st["work"] is not None else None
+        return chosen if chosen in EFFORTS else llm_effort
+
     def pending_info(work: Path) -> dict:
         """Batches not yet collected, from the state file (no API call)."""
         from ..batch import pending_batches
@@ -174,7 +180,7 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
                     d.update(label=label, note=note)
         out = {"work_dir": None, "input_dir": None, "stats": None,
                "detect": job.status() if job else None, "llm_model": current_model(),
-               "llm_models": models, "pending": None, "guess_dates": False,
+               "llm_models": models, "llm_effort": current_effort(), "llm_efforts": list(EFFORTS), "pending": None, "guess_dates": False,
                "export": ex.status() if ex else None, "export_dir": None,
                "exiftool": exiftool_info(),
                "api_key": bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"))}
@@ -247,17 +253,20 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
 
     # ---------- detection ----------
 
-    def linker(model: str | None = None):
-        """The Claude client for a model (default: the project's), created on first use."""
-        model = model or current_model()
+    def linker(model: str | None = None, effort: str | None = None):
+        """The Claude client for a model and effort (default: the project's), created on
+        first use. A batch passes the model and effort it was sent with."""
+        if model is None:
+            model, effort = current_model(), current_effort()
+        key = (model, effort)
         with llm_lock:
-            if model not in st["llms"]:
+            if key not in st["llms"]:
                 from ..llm import LlmLinker, LlmUnavailable
                 try:
-                    st["llms"][model] = LlmLinker(model)
+                    st["llms"][key] = LlmLinker(model, effort)
                 except LlmUnavailable as e:
                     raise HTTPException(503, str(e)) from e
-            return st["llms"][model]
+            return st["llms"][key]
 
     @app.post("/api/settings")
     def post_settings(body: dict = Body(...)) -> dict:
@@ -267,6 +276,11 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
             if model not in model_ids:
                 raise HTTPException(422, f"Unknown model {model!r}")
             save_llm_model(work, model)
+        if "llm_effort" in body:
+            effort = body["llm_effort"] or None
+            if effort is not None and effort not in EFFORTS:
+                raise HTTPException(422, f"Unknown effort {effort!r}")
+            save_llm_effort(work, effort)
         if "guess_dates" in body:
             save_guess_dates(work, bool(body["guess_dates"]))
         return project_info()
@@ -310,7 +324,7 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
         out = []
         for entry in pending_batches(work):
             try:
-                out.append(batch_status(linker(entry["model"]), entry))
+                out.append(batch_status(linker(entry["model"], entry.get("effort")), entry))
             except HTTPException:
                 raise
             except Exception as e:  # network trouble: report, keep the others
@@ -328,8 +342,9 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
             raise HTTPException(409, "Detection is running; collect when it has finished.")
         log: list[str] = []
         updated = kept = 0
-        for model in sorted({b["model"] for b in pending_batches(work)}):
-            u, k = collect(linker(model), work, debug=True, log=log.append)
+        for model, effort in sorted({(b["model"], b.get("effort")) for b in pending_batches(work)},
+                                    key=str):
+            u, k = collect(linker(model, effort), work, debug=True, log=log.append)
             updated, kept = updated + u, kept + k
         dates = False
         ex = st["export"]

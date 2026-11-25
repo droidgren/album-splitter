@@ -419,7 +419,7 @@ def guess_dates(linker: LlmLinker, work_dir: Path, input_dir: Path, *, force: bo
     for album, pages in albums(work_dir).items():
         if only_albums is not None and album not in only_albums:
             continue
-        work += [(r, pages) for r in build_requests(album, pages, linker.model)]
+        work += [(r, pages) for r in build_requests(album, pages, linker.tag)]
     rep.requests = len(work)
     for n, (req, pages) in enumerate(work):
         if on_progress:
@@ -446,7 +446,7 @@ def guess_dates(linker: LlmLinker, work_dir: Path, input_dir: Path, *, force: bo
             if data is None:
                 rep.failed += 1
                 continue
-            write_cache(path, req.digest, linker.model, data)
+            write_cache(path, req.digest, linker.model, data, linker.effort)
             rep.called += 1
         ans = parse_answer(req, data, linker.model, {k: v.page for k, v in by_id.items()})
         updated = 0

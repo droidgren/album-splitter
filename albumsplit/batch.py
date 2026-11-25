@@ -84,6 +84,7 @@ class BatchQueue:
         batch = self.linker.client.messages.batches.create(requests=self._items)
         state = load_state(self.work_dir)
         state["batches"].append({"id": batch.id, "model": self.linker.model,
+                                 "effort": self.linker.effort,
                                  "input_dir": str(self.input_dir), "pages": self._pages,
                                  "collected": False, "submitted": time.time(),
                                  "keep_links": self.keep_links})
@@ -132,7 +133,8 @@ def collect(linker: LlmLinker, work_dir: Path, *, debug: bool = True,
     state = load_state(work_dir)
     updated = failed = 0
     for entry in state["batches"]:
-        if entry["collected"] or entry["model"] != linker.model:  # cache keys depend on the model
+        if entry["collected"] or (entry["model"], entry.get("effort")) != (linker.model, linker.effort):
+            # cache keys depend on the model and effort
             continue
         b = linker.client.messages.batches.retrieve(entry["id"])
         if b.processing_status != "ended":
@@ -151,7 +153,8 @@ def collect(linker: LlmLinker, work_dir: Path, *, debug: bool = True,
             if data is None:
                 failed += 1
                 continue
-            write_cache(work_dir / "llm" / f"{page_id}.json", r.custom_id, linker.model, data)
+            write_cache(work_dir / "llm" / f"{page_id}.json", r.custom_id, linker.model, data,
+                        linker.effort)
             got.append(page_id)
         for page_id in got:
             if _apply_cached(linker, work_dir, Path(entry["input_dir"]), page_id, debug, log,

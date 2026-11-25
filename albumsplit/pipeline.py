@@ -89,6 +89,18 @@ def load_llm_model(work_dir: Path) -> str | None:
         return None
 
 
+def save_llm_effort(work_dir: Path, effort: str | None) -> None:
+    """Remember the Claude effort level chosen on the start page (None = the model's default)."""
+    _update_config(work_dir, llm_effort=effort)
+
+
+def load_llm_effort(work_dir: Path) -> str | None:
+    try:
+        return _load_config(work_dir).get("llm_effort") or None
+    except (OSError, ValueError):
+        return None
+
+
 def save_guess_dates(work_dir: Path, on: bool) -> None:
     """Remember whether Claude should guess dates from the album order (`dates.py`)."""
     _update_config(work_dir, guess_dates=bool(on))

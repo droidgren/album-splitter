@@ -97,6 +97,19 @@ function renderModels(proj) {
   sel.value = proj.llm_model;
   const cur = proj.llm_models.find((m) => m.id === proj.llm_model);
   $("model-note").textContent = cur && cur.note ? cur.note + " per million tokens in / out" : "";
+  const eff = $("llm-effort");
+  if (eff.options.length !== proj.llm_efforts.length + 1) {
+    eff.innerHTML = "";
+    eff.add(new Option("Model default", ""));
+    for (const e of proj.llm_efforts) eff.add(new Option(e[0].toUpperCase() + e.slice(1), e));
+  }
+  eff.value = proj.llm_effort || "";
+}
+
+async function setEffort() {
+  try {
+    renderProject(await post("/api/settings", { llm_effort: $("llm-effort").value || null }));
+  } catch (e) { msg("detect-msg", e.message, true); }
 }
 
 async function setModel() {
@@ -177,7 +190,7 @@ function redetectAll() {
     + "will lose your changes (frames, links, captions, dates) and go back to unreviewed.");
   if ($("opt-llm").checked) lines.push("", `Claude (${$("llm-model").selectedOptions[0].text}) is asked about every page`
     + (llmMode() === "batch" ? " as a batch, at half price." : ", at full price.")
-    + " A page that detects the same as last time, with the same model, is answered from the cache"
+    + " A page that detects the same as last time, with the same model and effort, is answered from the cache"
     + " for free, so this costs little unless detection or the model has changed.");
   if (confirm(lines.join("\n"))) startDetect(true);
 }
@@ -387,6 +400,7 @@ for (const id of ["opt-llm", "opt-claude-only"]) {
   $(id).addEventListener("change", () => { syncOptions(); if (stats) updateDetectButton(stats); });
 }
 $("llm-model").addEventListener("change", setModel);
+$("llm-effort").addEventListener("change", setEffort);
 $("opt-guess-dates").addEventListener("change", setGuessDates);
 $("guess-dates").addEventListener("click", (e) => { e.preventDefault(); guessDatesNow(); });
 $("batch-check").addEventListener("click", () => { msg("batch-msg", "Checking…"); pollBatches().then(() => {

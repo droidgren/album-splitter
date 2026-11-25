@@ -141,7 +141,8 @@ def test_llm_page_answer_keeps_date_issues():
 
 
 class FakeLinker:
-    model = "m"
+    model = tag = "m"
+    effort = None
 
     def __init__(self, answer):
         self.answer, self.calls = answer, 0

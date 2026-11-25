@@ -10,10 +10,10 @@ from pathlib import Path
 
 from .detect import Params
 from .imageio import find_images
-from .llm import DEFAULT_MODEL
+from .llm import DEFAULT_MODEL, EFFORTS
 from .model import assign_page_ids
-from .pipeline import (load_guess_dates, load_input_dir, load_llm_model, process_page,
-                       save_guess_dates, save_input_dir)
+from .pipeline import (load_guess_dates, load_input_dir, load_llm_effort, load_llm_model,
+                       process_page, save_guess_dates, save_input_dir)
 
 
 def cmd_detect(args: argparse.Namespace) -> int:
@@ -43,7 +43,7 @@ def cmd_detect(args: argparse.Namespace) -> int:
     if args.guess_dates:
         save_guess_dates(work_dir, True)  # so llm-collect and the start page know
     if args.llm or args.llm_batch:
-        llm = _make_linker(args.llm_model)
+        llm = _make_linker(args.llm_model, args.llm_effort)
         if llm is None:
             return 1
     if args.llm_batch:
@@ -117,16 +117,17 @@ def cmd_guess_dates(args: argparse.Namespace) -> int:
     if input_dir is None or not input_dir.is_dir():
         print(f"Scan folder {input_dir} not found; pass --input", file=sys.stderr)
         return 1
-    llm = _make_linker(args.llm_model or load_llm_model(work_dir) or DEFAULT_MODEL)
+    llm = _make_linker(args.llm_model or load_llm_model(work_dir) or DEFAULT_MODEL,
+                       args.llm_effort or load_llm_effort(work_dir))
     if llm is None:
         return 1
     return 0 if _guess(llm, work_dir, input_dir, force=args.force) else 1
 
 
-def _make_linker(model: str):
+def _make_linker(model: str, effort: str | None = None):
     from .llm import LlmLinker, LlmUnavailable
     try:
-        return LlmLinker(model)
+        return LlmLinker(model, effort)
     except LlmUnavailable as e:
         print(f"--llm: {e}", file=sys.stderr)
         return None
@@ -153,24 +154,27 @@ def cmd_llm_collect(args: argparse.Namespace) -> int:
     if not pending:
         print("No uncollected batches.")
         return 0
-    for model in sorted({b["model"] for b in pending}):
-        llm = _make_linker(model)
+    groups = sorted({(b["model"], b.get("effort")) for b in pending}, key=str)
+    for model, effort in groups:
+        llm = _make_linker(model, effort)
         if llm is None:
             return 1
         if args.wait:
             try:
-                wait(llm, [b["id"] for b in pending if b["model"] == model])
+                wait(llm, [b["id"] for b in pending
+                           if (b["model"], b.get("effort")) == (model, effort)])
             except KeyboardInterrupt:
                 print("\nStopped waiting.")
                 return 1
         updated, failed = collect(llm, work_dir, debug=args.debug)
-        print(f"{model}: {updated} pages updated" + (f", {failed} kept heuristic links" if failed else ""))
+        print(f"{llm.tag}: {updated} pages updated" + (f", {failed} kept heuristic links" if failed else ""))
     left = len(pending_batches(work_dir))
     if left:
         print(f"{left} batch(es) still running; run llm-collect again later or add --wait.")
     elif load_guess_dates(work_dir):
         input_dir = load_input_dir(work_dir)
-        llm = _make_linker(load_llm_model(work_dir) or pending[-1]["model"])
+        llm = _make_linker(load_llm_model(work_dir) or pending[-1]["model"],
+                           load_llm_effort(work_dir))
         if llm is None or input_dir is None or not _guess(llm, work_dir, input_dir):
             return 1
     return 0
@@ -192,7 +196,7 @@ def cmd_review(args: argparse.Namespace) -> int:
         if input_dir is not None and not input_dir.is_dir():
             print(f"Scan folder {input_dir} not found; pass --input", file=sys.stderr)
             return 1
-    app = create_app(work_dir, input_dir, llm_model=args.llm_model)
+    app = create_app(work_dir, input_dir, llm_model=args.llm_model, llm_effort=args.llm_effort)
     base = f"http://{'localhost' if args.host in ('127.0.0.1', '0.0.0.0') else args.host}:{args.port}"
     # Straight into review when the project is known, else the start page to choose one.
     url = base + ("/review" if work_dir and input_dir and (work_dir / "pages").is_dir() else "/")
@@ -267,6 +271,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="link and transcribe captions with Claude (needs ANTHROPIC_API_KEY)")
     d.add_argument("--llm-model", default=DEFAULT_MODEL,
                    help=f"Claude model for --llm (default: {DEFAULT_MODEL})")
+    d.add_argument("--llm-effort", choices=EFFORTS,
+                   help="Claude effort: lower is cheaper, less thinking (default: the model's)")
     d.add_argument("--llm-batch", action="store_true",
                    help="like --llm, but through the Batch API: half price, results within 24 h")
     d.add_argument("--guess-dates", action="store_true",
@@ -280,6 +286,8 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--input", help="scan directory (default: the one detect used)")
     g.add_argument("--llm-model", help="Claude model (default: the project's, else "
                                        f"{DEFAULT_MODEL})")
+    g.add_argument("--llm-effort", choices=EFFORTS,
+                   help="Claude effort (default: the project's, else the model's)")
     g.add_argument("--force", action="store_true", help="ask again even where an answer is cached")
     g.set_defaults(func=cmd_guess_dates)
 
@@ -295,6 +303,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--input", help="scan directory (default: the one detect used)")
     r.add_argument("--llm-model", default=DEFAULT_MODEL,
                    help=f"Claude model for re-reading pages and stamps (default: {DEFAULT_MODEL})")
+    r.add_argument("--llm-effort", choices=EFFORTS,
+                   help="Claude effort for re-reading (default: the model's; the start page can choose another)")
     r.add_argument("--host", default="127.0.0.1", help="use 0.0.0.0 to reach it from other machines")
     r.add_argument("--port", type=int, default=8000)
     r.add_argument("--open", action=argparse.BooleanOptionalAction, default=None,
