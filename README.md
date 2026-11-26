@@ -118,8 +118,10 @@ Useful options (see `--help` on each command):
   `--llm-model` picks the Claude model.
 - `guess-dates <work>`: guess dates for undated photos again. Only use this for albums scanned
   in order.
-- `claude-code <work>`: let Claude Code read the detected pages instead of the API key, using
-  your Claude Code login (subscription). `--dates` also guesses dates, `--flagged` / `--only`
+- `claude-code <work>`: let Claude Code do the Claude part instead of the API key, using your
+  Claude Code login (subscription): read the captions on the detected pages, look for date stamps
+  on photos where the OCR found none, then guess the dates still missing from the captions, the
+  other photos and the album order. `--steps pages,stamps` picks steps, `--flagged` / `--only`
   pick pages, `--model sonnet` picks the model. With `--export` the requests are only written to
   `<work>/claude-code/requests/`, for a Claude Code session to answer ("answer the requests in
   D:\work\claude-code\requests"); run the command again to apply the answers.

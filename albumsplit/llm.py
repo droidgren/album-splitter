@@ -23,7 +23,7 @@ import numpy as np
 
 from .debug import photo_color
 from .imageio import downscale
-from .model import Issue, Link, Page, Photo, Point
+from .model import DateStamp, Issue, Link, Page, Photo, Point
 
 DEFAULT_MODEL = "claude-opus-5-5"
 # Models offered on the start page: (id, label, note). Prices per million input/output tokens.
@@ -151,7 +151,7 @@ SCHEMA: dict[str, Any] = {
 }
 
 
-STAMP_PROMPT_VERSION = 1
+STAMP_PROMPT_VERSION = 2
 STAMP_SYSTEM_PROMPT = """\
 You read the date that a film camera printed into a photo: small orange or red
 seven-segment digits, usually near a corner, such as 6 5 '95, '93 7 14 or 98 6 26. The
@@ -164,8 +164,14 @@ Answer:
 - text: the stamp exactly as printed, with the spaces and apostrophe, e.g. "6 5 '95".
   Use ? for a digit you cannot read. Empty if not found.
 - date: the date as YYYY-MM-DD, or null if you cannot read it with confidence. When the
-  field order is ambiguous (e.g. 6 5 '95), choose the order that matches the camera dates
-  of other photos on the same page if they are given, otherwise day month year."""
+  field order is ambiguous (e.g. 6 5 '95), use the field order of the stamps on other photos
+  of the same page if they are given (e.g. "24 5 '92" = 1992-05-24 is day month 'year, so
+  "5 6 '92" is 1992-06-05), otherwise day month year. Keep that order even if another order
+  would give a date closer to theirs.
+- corner: when close-ups of the photo's corners were sent, the one that shows the stamp
+  ("bottom right", "top left", "bottom left" or "top right", without ", turned"), or
+  "elsewhere" if the stamp is in the photo but in none of them. Empty if not found or if no
+  corner close-ups were sent."""
 
 STAMP_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -173,8 +179,10 @@ STAMP_SCHEMA: dict[str, Any] = {
         "found": {"type": "boolean"},
         "text": {"type": "string"},
         "date": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "corner": {"type": "string", "enum": ["bottom right", "top left", "bottom left",
+                                              "top right", "elsewhere", ""]},
     },
-    "required": ["found", "text", "date"],
+    "required": ["found", "text", "date", "corner"],
     "additionalProperties": False,
 }
 
@@ -185,6 +193,7 @@ class StampAnswer:
     text: str
     date: str | None
     model: str
+    corner: str = ""  # the corner close-up that showed it (only sent with no stamp box)
 
 
 class LlmUnavailable(RuntimeError):
@@ -364,9 +373,10 @@ class LlmLinker:
                 return None
             write_cache(cache_path, digest, self.model, data, self.effort)
         found = bool(data.get("found"))
+        corner = data.get("corner") if found and photo.stamp is None else ""
         return StampAnswer(found=found, text=(data.get("text") or "").strip() if found else "",
                            date=normalize_date(data.get("date")) if found else None,
-                           model=self.model)
+                           model=self.model, corner=corner if corner in CORNERS else "")
 
     def prepare_stamp(self, page: Page, photo: Photo, img_bgr: np.ndarray
                       ) -> tuple[list[dict], str]:
@@ -395,7 +405,10 @@ class LlmLinker:
                 jpg = _encode(crop)
                 h.update(jpg)
                 content += [{"type": "text", "text": f"{name}:"}, _image(jpg)]
-        others = sorted({p.stamp.date for p in page.photos
+        # As printed too: the field order (day month 'year, 'year month day, ...) is the
+        # camera's, and the same camera usually took the other photos of the page.
+        others = sorted({(f'"{p.stamp.text}" = ' if p.stamp.text else "") + p.stamp.date
+                         for p in page.photos
                          if p.id != photo.id and p.stamp and p.stamp.date})
         lines = []
         if st is not None and st.text:
@@ -589,6 +602,30 @@ def apply(page: Page, result: LlmResult, *, keep_links: bool = False) -> None:
         t.date = a.date
     page.links.sort(key=lambda lk: (lk.text_id, lk.photo_id))
     page.linker = f"llm:{result.model}"
+    check_stamps_against_captions(page)
+
+
+CAPTION_CHECK = "caption-check"  # source of the issues set by check_stamps_against_captions
+
+
+def check_stamps_against_captions(page: Page) -> None:
+    """Flag photos whose stamp date no linked caption date agrees with (at the caption's
+    precision). Where a caption gives a date it nearly always matches the stamp, so a conflict
+    is mostly a misread stamp (dotted digits: 9 read as 8) or a camera clock set wrong.
+    The issues are recomputed each time."""
+    issues = []
+    for ph in page.photos:
+        st = ph.stamp
+        if st is None or not st.date:
+            continue
+        said = [t.date for t in page.linked_texts(ph.id) if t.date]
+        if said and not any(st.date.startswith(d) for d in said):
+            ph.needs_review = True
+            issues.append(Issue(kind="stamp_mismatch", photo_ids=[ph.id], source=CAPTION_CHECK,
+                                note=f"P{ph.id} date stamp {st.date} (read \"{st.text or '?'}\"), "
+                                     f"but the caption says {', '.join(dict.fromkeys(said))}: "
+                                     "check the stamp, or the camera clock was wrong"))
+    page.issues = [i for i in page.issues if i.source != CAPTION_CHECK] + issues
 
 
 def render_overview(page: Page, img_bgr: np.ndarray) -> np.ndarray:
@@ -696,6 +733,7 @@ def stamp_zoom(img_bgr: np.ndarray, corners: list[Point], grow_w: float = 1.6,
 
 CORNER_W, CORNER_H = 0.45, 0.22  # corner close-ups: fraction of the photo's long / short side
 CORNER_LONG_SIDE = 1000
+CORNERS = ("bottom right", "top left", "bottom left", "top right")
 
 
 def stamp_corners(img_bgr: np.ndarray, corners: list[Point]) -> list[tuple[str, np.ndarray]]:
@@ -704,6 +742,17 @@ def stamp_corners(img_bgr: np.ndarray, corners: list[Point]) -> list[tuple[str, 
     In the camera's orientation the stamp runs along the bottom long edge, so with the photo
     turned to landscape it reads upright at the bottom, and upside down at the top (a print
     lying the other way round): the top crops are turned 180°."""
+    out = []
+    for name, quad in corner_quads(corners):
+        crop = warp_quad(img_bgr, quad)
+        label = name + (", turned" if name.startswith("top") else "")
+        out.append((label, downscale(crop, CORNER_LONG_SIDE)[0]))
+    return out
+
+
+def corner_quads(corners: list[Point]) -> list[tuple[str, list[Point]]]:
+    """The corner regions of `stamp_corners` (names as in `CORNERS`), each in the reading
+    direction of a stamp there: usable as the corners of a `DateStamp`."""
     q = np.array(corners, np.float64)
     w = np.linalg.norm(q[1] - q[0]) + np.linalg.norm(q[2] - q[3])
     h = np.linalg.norm(q[3] - q[0]) + np.linalg.norm(q[2] - q[1])
@@ -717,16 +766,39 @@ def stamp_corners(img_bgr: np.ndarray, corners: list[Point]) -> list[tuple[str, 
 
     out = []
     for name, u0, v0, flip in [("bottom right", 1 - CORNER_W, 1 - CORNER_H, False),
-                               ("top left, turned", 0.0, 0.0, True),
+                               ("top left", 0.0, 0.0, True),
                                ("bottom left", 0.0, 1 - CORNER_H, False),
-                               ("top right, turned", 1 - CORNER_W, 0.0, True)]:
+                               ("top right", 1 - CORNER_W, 0.0, True)]:
         u1, v1 = u0 + CORNER_W, v0 + CORNER_H
         quad = [at(u0, v0), at(u1, v0), at(u1, v1), at(u0, v1)]
         if flip:
             quad = quad[2:] + quad[:2]
-        crop = warp_quad(img_bgr, quad)
-        out.append((name, downscale(crop, CORNER_LONG_SIDE)[0]))
+        out.append((name, quad))
     return out
+
+
+def apply_stamp_answer(photo: Photo, ans: StampAnswer) -> bool:
+    """Put Claude's stamp reading on the photo. With a stamp box, it replaces the box's date
+    (older dates move to `date_alts`); without one, a found stamp in a corner close-up becomes
+    a stamp box over that corner. False if a found date had nowhere to go (no box and no corner):
+    the caller decides (review sets `photo.date`)."""
+    if not ans.found:
+        return True
+    reader = f"llm:{ans.model}"
+    st = photo.stamp
+    if st is not None:
+        old = [d for d in [st.date, *st.date_alts] if d and d != ans.date]
+        st.text = ans.text or st.text
+        st.date = ans.date
+        st.date_alts = list(dict.fromkeys(old))
+        st.reader = reader
+        return True
+    quad = dict(corner_quads(photo.corners)).get(ans.corner)
+    if quad is None:
+        return False
+    photo.stamp = DateStamp(corners=[(round(x, 1), round(y, 1)) for x, y in quad],
+                            text=ans.text or None, date=ans.date, reader=reader)
+    return True
 
 
 def _encode(img: np.ndarray) -> bytes:

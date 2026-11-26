@@ -594,13 +594,9 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
         if ans is None:
             raise HTTPException(502, "Claude gave no usable answer (details in the server log)")
         if ans.found:
-            if photo.stamp is not None:
-                old = [d for d in [photo.stamp.date, *photo.stamp.date_alts] if d and d != ans.date]
-                photo.stamp.text = ans.text or photo.stamp.text
-                photo.stamp.date = ans.date
-                photo.stamp.date_alts = list(dict.fromkeys(old))
-                photo.stamp.reader = f"llm:{ans.model}"
-            if ans.date and (photo.stamp is None or photo.date is not None):
+            from ..llm import apply_stamp_answer
+            placed = apply_stamp_answer(photo, ans)  # a box over the corner it was found in
+            if ans.date and (not placed or photo.date is not None):
                 photo.date = ans.date  # no stamp box to hold it, or replace a typed date
             with lock:
                 page.edited = True

@@ -172,3 +172,46 @@ def test_cache_keeps_token_usage_beside_the_answer(tmp_path):
     assert stored["usage"] == {"input_tokens": 5000, "output_tokens": 900,
                                "cache_read_input_tokens": 0}
     assert stored["effort"] == "low" and read_cache(tmp_path / "p.json", "h") == {"a": 1}
+
+
+def test_stamp_answer_in_a_corner_becomes_a_stamp_box():
+    from albumsplit.llm import StampAnswer, apply_stamp_answer, corner_quads
+    ph = Photo(id=1, corners=quad(0, 0, 400, 300))
+    ans = StampAnswer(found=True, text="6 5 '95", date="1995-05-06", model="m", corner="bottom right")
+    assert apply_stamp_answer(ph, ans)
+    st = ph.stamp
+    assert st.date == "1995-05-06" and st.reader == "llm:m" and not st.manual
+    assert st.corners == [tuple(round(v, 1) for v in p) for p in dict(corner_quads(ph.corners))["bottom right"]]
+    xs = [x for x, _ in st.corners]
+    ys = [y for _, y in st.corners]
+    assert min(xs) >= 200 and min(ys) >= 200  # over the bottom right of the photo
+
+
+def test_stamp_answer_without_a_corner_has_nowhere_to_go():
+    from albumsplit.llm import StampAnswer, apply_stamp_answer
+    ph = Photo(id=1, corners=quad(0, 0, 400, 300))
+    ans = StampAnswer(found=True, text="6 5 '95", date="1995-05-06", model="m", corner="elsewhere")
+    assert not apply_stamp_answer(ph, ans) and ph.stamp is None
+
+
+def test_stamp_answer_replaces_the_date_of_a_stamp_box():
+    from albumsplit.llm import StampAnswer, apply_stamp_answer
+    ph = Photo(id=1, corners=quad(0, 0, 400, 300), stamp=_stamp("6 5 '98", "1998-05-06"))
+    apply_stamp_answer(ph, StampAnswer(True, "6 5 '95", "1995-05-06", "m"))
+    assert ph.stamp.date == "1995-05-06" and ph.stamp.date_alts == ["1998-05-06"]
+
+
+def test_stamp_that_no_caption_agrees_with_is_flagged():
+    from albumsplit.llm import CAPTION_CHECK, check_stamps_against_captions
+    from albumsplit.model import Link, TextBlock
+    page = _page(_stamp("'98 9 11", "1998-09-11"), _stamp("'99 4 28", "1999-04-28"))
+    page.texts = [TextBlock(id=1, box=(0, 70, 90, 20), date="1999-09-11"),
+                  TextBlock(id=2, box=(100, 70, 90, 20), date="1999-04")]
+    page.links = [Link(1, 1), Link(2, 2)]
+    check_stamps_against_captions(page)
+    p1, p2 = page.photos
+    assert p1.needs_review and not p2.needs_review  # 1999-04 agrees with 1999-04-28
+    assert [(i.kind, i.photo_ids, i.source) for i in page.issues] == [("stamp_mismatch", [1], CAPTION_CHECK)]
+    p1.stamp.date = "1999-09-11"
+    check_stamps_against_captions(page)  # recomputed, not piled up
+    assert page.issues == []

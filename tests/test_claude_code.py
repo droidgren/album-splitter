@@ -163,3 +163,76 @@ def test_page_read_end_to_end(tmp_path, monkeypatch):
     assert not (work / "llm").exists()
     res = claude_page(llm, work, scans, path, debug=False, cache_dir=claude_code.llm_cache_dir(work))
     assert res.status == "cached"
+
+
+def _setup_page(tmp_path, page):
+    import cv2
+    from albumsplit.pipeline import page_json_path
+    scans = tmp_path / "scans"
+    scans.mkdir()
+    cv2.imwrite(str(scans / "IMG_1.png"), _img())
+    work = tmp_path / "work"
+    path = page_json_path(work, "IMG_1")
+    path.parent.mkdir(parents=True)
+    page.save(path)
+    return scans, work, path
+
+
+def test_stamps_step_reads_photos_without_a_stamp_box(tmp_path, monkeypatch):
+    from albumsplit.llm import STAMP_SCHEMA
+    from albumsplit.model import DateStamp, Photo
+    from albumsplit.pipeline import stamps_page
+    page = _page()
+    page.photos.append(Photo(id=2, corners=[(210, 160), (390, 160), (390, 290), (210, 290)],
+                             stamp=DateStamp(corners=[(300, 270), (380, 270), (380, 285), (300, 285)],
+                                             text="6 5 '95", date="1995-05-06")))
+    page.photos.append(Photo(id=3, corners=[(10, 160), (200, 160), (200, 290), (10, 290)],
+                             date="1990"))  # reviewer date: left alone
+    scans, work, path = _setup_page(tmp_path, page)
+    seen = []
+
+    def run(cmd, **kw):
+        seen.append(json.loads(cmd[cmd.index("--json-schema") + 1]))
+        out = {"found": True, "text": "'94 7 14", "date": "1994-07-14", "corner": "bottom left"}
+        return subprocess.CompletedProcess(cmd, 0, stderr="", stdout=json.dumps(
+            {"type": "result", "is_error": False, "structured_output": out}))
+    monkeypatch.setattr(claude_code.subprocess, "run", run)
+    llm = ClaudeCodeLinker(work, "opus", mode="run", claude=__file__)
+    res = stamps_page(llm, work, scans, path, debug=False, cache_dir=claude_code.llm_cache_dir(work))
+    assert (res.asked, res.found, res.unplaced, res.failed) == (1, 1, 0, 0)
+    assert seen == [STAMP_SCHEMA]
+    p1, p2, p3 = Page.load(path).photos
+    assert p1.stamp.date == "1994-07-14" and p1.stamp.reader == "llm:claude-code/opus"
+    assert p2.stamp.date == "1995-05-06" and p3.stamp is None
+    # Done once: a second run has nothing left to ask.
+    assert stamps_page(llm, work, scans, path, debug=False).asked == 0
+
+
+def test_stamps_step_flags_a_stamp_outside_the_corners(tmp_path, monkeypatch):
+    from albumsplit.pipeline import stamps_page
+    scans, work, path = _setup_page(tmp_path, _page())
+    _fake_run(monkeypatch, json.dumps({"type": "result", "is_error": False, "structured_output": {
+        "found": True, "text": "'94 7 14", "date": "1994-07-14", "corner": "elsewhere"}}))
+    llm = ClaudeCodeLinker(work, "opus", mode="run", claude=__file__)
+    for _ in range(2):  # the issue is not added twice
+        res = stamps_page(llm, work, scans, path, debug=False)
+    assert res.unplaced == 1
+    page = Page.load(path)
+    assert page.photos[0].stamp is None and page.photos[0].needs_review
+    assert [i.source for i in page.issues] == ["stamps"]
+
+
+def test_stamps_step_reads_an_undated_stamp_box_again(tmp_path, monkeypatch):
+    from albumsplit.model import DateStamp
+    from albumsplit.pipeline import stamps_page
+    page = _page()
+    box = [(150, 130), (195, 130), (195, 145), (150, 145)]
+    page.photos[0].stamp = DateStamp(corners=box, text="'?9 7 20")  # the OCR could not date it
+    scans, work, path = _setup_page(tmp_path, page)
+    _fake_run(monkeypatch, json.dumps({"type": "result", "is_error": False, "structured_output": {
+        "found": True, "text": "'99 7 20", "date": "1999-07-20", "corner": ""}}))
+    llm = ClaudeCodeLinker(work, "opus", mode="run", claude=__file__)
+    res = stamps_page(llm, work, scans, path, debug=False)
+    assert (res.asked, res.found) == (1, 1)
+    st = Page.load(path).photos[0].stamp
+    assert st.date == "1999-07-20" and st.corners == box and st.reader == "llm:claude-code/opus"

@@ -72,8 +72,17 @@ re-run or reviewed later without losing manual edits.
   same requests through Claude Code (the user's subscription). `ClaudeCodeLinker` only replaces
   `LlmLinker._call`, so prompts, validation and `apply` are shared. Works on detected pages
   like Claude-only (`pipeline.claude_page`, also used by the start page's Claude-only job:
-  links kept, approved or re-framed pages left alone); `--dates` / `--dates-only` run
-  `dates.guess_dates`. Each request becomes a folder `claude-code/requests/<key>__<hash>/`
+  links kept, approved or re-framed pages left alone). `--steps` (default all, in order):
+  `pages`; `stamps` (`pipeline.stamps_page`): every photo with no stamp date and no reviewer date
+  gets a stamp read (`llm.read_stamp`; an undated box gets its zoom, no box the corner
+  close-ups). Without a box Claude names the corner
+  (`STAMP_SCHEMA.corner`), so the stamp becomes a box over that corner (`llm.corner_quads`,
+  `apply_stamp_answer`, also used by review's "Read stamp with Claude"); found elsewhere: photo
+  flagged, issue source `"stamps"`; `dates`: `dates.guess_dates`. The stamp prompt gets the
+  other stamps of the page as printed (`"24 5 '92" = 1992-05-24`) so it keeps the camera's
+  field order. `llm.check_stamps_against_captions` (after every page answer and stamps step)
+  flags a stamp date that no linked caption date agrees with (`stamp_mismatch`, source
+  `"caption-check"`): on Album8 that caught exactly the dotted-style 9 -> 8 misreads. Each request becomes a folder `claude-code/requests/<key>__<hash>/`
   (`request.md` with the system prompt and `NN.jpg` images, `schema.json`, `answer.json`).
   Mode run: `claude -p` per request (`--json-schema`, `--system-prompt-file`, only the Read
   tool, no MCP, `ANTHROPIC_API_KEY` removed from its env so the login is used); `run.json`
@@ -137,6 +146,8 @@ Implemented in `albumsplit/review/` (vanilla JS, no build step/CDN). Notes:
   Both are cached under `<work_dir>/llm/` and undoable with Ctrl+Z. With no stamp box, the
   stamp request also carries full-resolution close-ups of the photo's four corners
   (`llm.stamp_corners`, top ones turned 180°): shrunk to page size a stamp is only a few pixels.
+  Claude says which corner showed it, and the stamp gets a box there (`photo.date` only if it
+  was seen elsewhere).
 - **S** / "Mark stamp" (or **Alt**+drag on a photo) marks where a missed stamp is
   (`POST .../photos/<id>/stamp_box`). Only the box is saved (`stamp.orient_box` turns it to
   reading direction), as an unread `stamp` with `manual: true`: no OCR, which already searched

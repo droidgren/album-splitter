@@ -126,6 +126,9 @@ def cmd_guess_dates(args: argparse.Namespace) -> int:
     return 0 if _guess(llm, work_dir, input_dir, force=args.force) else 1
 
 
+CLAUDE_CODE_STEPS = ("pages", "stamps", "dates")
+
+
 def cmd_claude_code(args: argparse.Namespace) -> int:
     import threading
     from concurrent.futures import ThreadPoolExecutor
@@ -133,7 +136,11 @@ def cmd_claude_code(args: argparse.Namespace) -> int:
     from .claude_code import ClaudeCodeLinker, llm_cache_dir, requests_dir
     from .llm import LlmUnavailable
     from .model import Page
-    from .pipeline import claude_page
+    from .pipeline import claude_page, stamps_page
+    steps = {x.strip() for x in args.steps.split(",") if x.strip()}
+    if not steps or steps - set(CLAUDE_CODE_STEPS):
+        print(f"--steps: choose from {','.join(CLAUDE_CODE_STEPS)}", file=sys.stderr)
+        return 1
     work_dir = Path(args.work_dir).resolve()
     if not (work_dir / "pages").is_dir():
         print(f"No pages in {work_dir}; run detect first", file=sys.stderr)
@@ -151,67 +158,97 @@ def cmd_claude_code(args: argparse.Namespace) -> int:
     if llm.claude:
         print(f"Claude Code: {llm.claude} (model {args.model})")
     cache = llm_cache_dir(work_dir)
-    ok = True
-    if not args.dates_only:
-        paths = []
-        for path in sorted((work_dir / "pages").glob("*.json")):
-            pg = Page.load(path)
-            if pg.status == "approved":
-                continue
-            if args.only and not fnmatch.fnmatch(pg.page_id, args.only):
-                continue
-            if args.flagged and not (pg.issues or any(ph.needs_review for ph in pg.photos)):
-                continue
-            paths.append(path)
-        print(f"{len(paths)} pages to read")
-        counts: dict[str, int] = {}
-        lock = threading.Lock()
+    paths = []
+    for path in sorted((work_dir / "pages").glob("*.json")):
+        pg = Page.load(path)
+        if pg.status == "approved":
+            continue
+        if args.only and not fnmatch.fnmatch(pg.page_id, args.only):
+            continue
+        if args.flagged and not (pg.issues or any(ph.needs_review for ph in pg.photos)):
+            continue
+        paths.append(path)
+    counts: dict[str, int] = {}
+    lock = threading.Lock()
 
-        def count(status: str) -> None:
+    def count(status: str, n: int = 1) -> None:
+        if n:
             with lock:
-                counts[status] = counts.get(status, 0) + 1
+                counts[status] = counts.get(status, 0) + n
 
-        def one(path: Path) -> None:
-            t0 = time.perf_counter()
-            try:
-                res = claude_page(llm, work_dir, input_dir, path, debug=args.debug,
-                                  cache_dir=cache)
-            except Exception as e:  # keep going on a bad page
-                count("failed")
-                print(f"{path.stem}: ERROR {e}")
-                return
-            status = "waiting" if res.status == "failed" and args.export else res.status
-            count(status)
-            pg = res.page
-            note = {"called": "read by Claude Code", "cached": "cached",
-                    "failed": "no answer, page unchanged", "waiting": "request written",
-                    "skipped": "changed meanwhile, not updated"}[status]
-            if res.status in ("called", "cached"):
-                read = sum(1 for t in pg.texts if t.transcription)
-                note = f"{read} of {len(pg.texts)} texts read, {note}"
-                if pg.issues:
-                    note += f", {len(pg.issues)} issues"
-            print(f"{pg.page_id}: {note}  ({time.perf_counter() - t0:.1f}s)")
-
+    def run_all(fn) -> None:
         with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
-            list(pool.map(one, paths))
-        print("Pages: " + ", ".join(f"{v} {k}" for k, v in sorted(counts.items())) if counts
-              else "Pages: nothing to do")
-        if args.export and llm.pending:
-            print(f"{llm.pending} requests wait for an answer in {requests_dir(work_dir)} "
-                  "(see README.md there); run this command again afterwards.")
-        ok = not counts.get("failed")
-    if args.dates or args.dates_only:
-        if args.export and llm.pending and not args.dates_only:
-            print("Dates are guessed once the page answers are in: run with --dates-only then.")
-        else:
-            pending = llm.pending
-            ok = _guess(llm, work_dir, input_dir, force=args.force, cache_dir=cache) and ok
-            if args.export and llm.pending > pending:
-                print(f"{llm.pending - pending} date requests wait for an answer in "
-                      f"{requests_dir(work_dir)}; run this command again afterwards.")
-    return 0 if ok else 1
+            list(pool.map(fn, paths))
 
+    def report(what: str) -> None:
+        print(f"{what}: " + (", ".join(f"{v} {k}" for k, v in sorted(counts.items()))
+                             if counts else "nothing to do"))
+
+    def one_page(path: Path) -> None:
+        t0 = time.perf_counter()
+        try:
+            res = claude_page(llm, work_dir, input_dir, path, debug=args.debug, cache_dir=cache)
+        except Exception as e:  # keep going on a bad page
+            count("failed")
+            print(f"{path.stem}: ERROR {e}")
+            return
+        status = "waiting" if res.status == "failed" and args.export else res.status
+        count(status)
+        pg = res.page
+        note = {"called": "read by Claude Code", "cached": "cached",
+                "failed": "no answer, page unchanged", "waiting": "request written",
+                "skipped": "changed meanwhile, not updated"}[status]
+        if res.status in ("called", "cached"):
+            read = sum(1 for t in pg.texts if t.transcription)
+            note = f"{read} of {len(pg.texts)} texts read, {note}"
+            if pg.issues:
+                note += f", {len(pg.issues)} issues"
+        print(f"{pg.page_id}: {note}  ({time.perf_counter() - t0:.1f}s)")
+
+    def one_stamps(path: Path) -> None:
+        t0 = time.perf_counter()
+        try:
+            res = stamps_page(llm, work_dir, input_dir, path, debug=args.debug, cache_dir=cache)
+        except Exception as e:
+            count("failed")
+            print(f"{path.stem}: ERROR {e}")
+            return
+        if not res.asked:
+            return
+        failed = "waiting" if args.export else "failed"
+        count("photos asked", res.asked)
+        count("stamps read", res.found)
+        count("found outside a corner (flagged)", res.unplaced)
+        count(failed, res.failed)
+        parts = [f"{res.found} of {res.asked} photos without a stamp date have one"]
+        if res.unplaced:
+            parts.append(f"{res.unplaced} outside a corner, flagged")
+        if res.failed:
+            parts.append(f"{res.failed} {'requests written' if args.export else 'without an answer'}")
+        print(f"{res.page.page_id}: stamps: {', '.join(parts)}  ({time.perf_counter() - t0:.1f}s)")
+
+    ok = True
+    if "pages" in steps:
+        print(f"Reading {len(paths)} pages...")
+        run_all(one_page)
+        report("Pages")
+        ok = not counts.get("failed")
+    if "stamps" in steps:
+        counts.clear()
+        print("Looking for date stamps nobody has read yet...")
+        run_all(one_stamps)
+        report("Stamps")
+        ok = ok and not counts.get("failed")
+    if "dates" in steps:
+        if args.export and llm.pending and steps != {"dates"}:
+            print("Dates are guessed once the page and stamp answers are in: "
+                  "run with --steps dates afterwards.")
+        else:
+            ok = _guess(llm, work_dir, input_dir, force=args.force, cache_dir=cache) and ok
+    if args.export and llm.pending:
+        print(f"{llm.pending} requests wait for an answer in {requests_dir(work_dir)} "
+              "(see README.md there); run this command again afterwards.")
+    return 0 if ok or (args.export and llm.pending) else 1
 
 def _make_linker(model: str, effort: str | None = None):
     from .llm import LlmLinker, LlmUnavailable
@@ -390,9 +427,11 @@ def main(argv: list[str] | None = None) -> int:
     cc.add_argument("--only", help="only pages whose id matches this glob")
     cc.add_argument("--flagged", action="store_true",
                     help="only pages flagged for a check (issues or a photo to review)")
-    cc.add_argument("--dates", action="store_true",
-                    help="afterwards guess dates from the album order")
-    cc.add_argument("--dates-only", action="store_true", help="only guess dates")
+    cc.add_argument("--steps", default=",".join(CLAUDE_CODE_STEPS),
+                    help="what to do, in this order (default: all): pages = read captions, link "
+                         "them and check the OCR's stamps; stamps = look for date stamps on photos "
+                         "with no stamp date yet; dates = guess the dates still missing from "
+                         "the captions, the other photos and the album order")
     cc.add_argument("--export", action="store_true",
                     help="only write the requests to <work_dir>/claude-code/requests/ for a "
                          "Claude Code session to answer; answers already there are applied")

@@ -224,3 +224,76 @@ def claude_page(llm: LlmLinker, work_dir: Path, input_dir: Path, path: Path, *,
         out.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(out), render_debug(now, img), [cv2.IMWRITE_JPEG_QUALITY, 85])
     return ClaudeResult("cached" if res.cached else "called", now)
+
+
+@dataclass
+class StampsResult:
+    asked: int = 0     # photos sent to Claude
+    found: int = 0     # stamps Claude read a date from, now on the page
+    unplaced: int = 0  # found, but not in a corner close-up: the photo is flagged instead
+    failed: int = 0    # no usable answer
+    page: Page | None = None
+
+
+def stamps_page(llm: LlmLinker, work_dir: Path, input_dir: Path, path: Path, *,
+                page_lock=None, debug: bool = True, cache_dir: Path | None = None
+                ) -> StampsResult:
+    """Let Claude look for the camera date stamp on every photo of the page that has no stamp
+    date and no reviewer date. With no stamp box (the OCR found nothing), it gets the photo and
+    full resolution close-ups of its corners (`llm.prepare_stamp`), and a stamp it reads becomes
+    a stamp box over that corner. A box with no date (unreadable to the OCR and to the page
+    request) gets a second, closer look on its own. Dated boxes are checked by the page request."""
+    from contextlib import nullcontext
+
+    from .llm import apply_stamp_answer, check_stamps_against_captions
+    from .model import Issue
+    res = StampsResult()
+    page = Page.load(path)
+    # No stamp box, or a box nobody could read a date from (OCR or the page request).
+    todo = [ph for ph in page.photos
+            if ph.date is None and (ph.stamp is None or not ph.stamp.date)]
+    res.page = page
+    if page.status == "approved" or not todo:
+        return res
+    img = load_bgr(input_dir / page.source)
+    cache = cache_dir or work_dir / "llm"
+    answers = {}
+    for ph in todo:
+        res.asked += 1
+        ans = llm.read_stamp(page, ph, img, cache)
+        if ans is None:
+            res.failed += 1
+        elif ans.found and ans.date:
+            answers[ph.id] = ans
+    if not answers:
+        return res
+    with page_lock or nullcontext():
+        now = Page.load(path)  # it may have been edited in review meanwhile
+        if now.status == "approved":
+            return res
+        photos = {p.id: p for p in now.photos}
+        for pid, ans in answers.items():
+            ph = photos.get(pid)
+            old = next((p for p in page.photos if p.id == pid), None)
+            if (ph is None or ph.date is not None or ph.corners != old.corners
+                    or (ph.stamp is not None and ph.stamp.date)
+                    or (ph.stamp is None) != (old.stamp is None)):
+                continue
+            if apply_stamp_answer(ph, ans):
+                res.found += 1
+            else:
+                res.unplaced += 1
+                ph.needs_review = True
+                now.issues = [i for i in now.issues if not (i.source == "stamps"
+                                                            and i.photo_ids == [pid])]
+                now.issues.append(Issue(kind="other", photo_ids=[pid], source="stamps", note=(
+                    f"P{pid}: Claude read the date stamp \"{ans.text}\" = {ans.date}, but not in "
+                    "a corner: mark the stamp (S) and read it again")))
+        check_stamps_against_captions(now)
+        now.save(path)
+    res.page = now
+    if debug:
+        out = debug_path(work_dir, now.page_id)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(out), render_debug(now, img), [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return res
