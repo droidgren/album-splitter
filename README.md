@@ -59,6 +59,7 @@ work folder, so you can stop at any point and continue later.
 | **←** / **→** | previous / next page |
 | **N** | next page not yet reviewed |
 | **F** | only visit pages flagged for a check |
+| **E** | show all pages, only edited ones, or only ones not edited |
 | Click a caption, then a photo | link or unlink them |
 | Drag on empty paper | new caption box (**Shift**+drag: new photo) |
 | Drag a corner | move the two edges that meet there (**Ctrl**+drag: only that corner) |

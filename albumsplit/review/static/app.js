@@ -5,6 +5,7 @@
 
 // Same colours as debug.PALETTE (which is BGR there).
 const PALETTE = ["#e62828", "#1478e6", "#1eb41e", "#ffa000", "#c828c8", "#00c8c8", "#a06414", "#780078"];
+const EDIT_FILTERS = ["all", "edited", "unedited"];
 const GREY = "#969696";
 const HANDLE = 7;      // handle half-size, canvas px
 const DRAG_MIN = 5;    // px before a press becomes a drag
@@ -26,6 +27,8 @@ const S = {
   busy: false,               // waiting for Claude: edits are blocked, its answer replaces the page
   stampFor: null,            // photo id whose date stamp the next drag marks (S / "Mark stamp")
   flaggedOnly: localStorage.getItem("albumsplit.flaggedOnly") === "1",  // navigate flagged pages only
+  editFilter: EDIT_FILTERS.includes(localStorage.getItem("albumsplit.editFilter"))  // all | edited | unedited
+    ? localStorage.getItem("albumsplit.editFilter") : "all",
 };
 
 const colorOf = (pid) => PALETTE[(pid - 1) % PALETTE.length];
@@ -57,7 +60,11 @@ async function init() {
 
 // Flagged = what the start page counts as "flagged for a check".
 const isFlagged = (p) => p.status !== "approved" && (p.issues > 0 || p.needs_review > 0);
-const visible = (p) => !S.flaggedOnly || isFlagged(p);
+const editOk = (p) => S.editFilter === "all" || (S.editFilter === "edited") === !!p.edited;
+const visible = (p) => (!S.flaggedOnly || isFlagged(p)) && editOk(p);
+const filtered = () => S.flaggedOnly || S.editFilter !== "all";
+// What the filters let through, for hints: "flagged", "edited", "unedited flagged", ...
+const filterName = () => [S.editFilter !== "all" ? S.editFilter : "", S.flaggedOnly ? "flagged" : ""].filter(Boolean).join(" ");
 
 // Keep the page list entry in step with the page as saved/edited, so the filter follows it.
 function syncEntry(page) {
@@ -77,16 +84,30 @@ function neighbour(dir) {
 async function step(dir) {
   const j = neighbour(dir);
   if (j >= 0) return go(j);
-  hint(S.flaggedOnly ? "No more flagged pages this way." : dir > 0 ? "Last page." : "First page.");
+  hint(filtered() ? `No more ${filterName()} pages this way.` : dir > 0 ? "Last page." : "First page.");
 }
 
 async function toggleFlagged() {
   S.flaggedOnly = !S.flaggedOnly;
   localStorage.setItem("albumsplit.flaggedOnly", S.flaggedOnly ? "1" : "0");
+  await filterChanged();
+}
+
+// E / the ✎ button: all pages -> only edited -> only not edited -> all.
+async function cycleEditFilter() {
+  S.editFilter = EDIT_FILTERS[(EDIT_FILTERS.indexOf(S.editFilter) + 1) % EDIT_FILTERS.length];
+  localStorage.setItem("albumsplit.editFilter", S.editFilter);
+  await filterChanged();
+}
+
+// If the current page is filtered out, go to the next one let through (unreviewed first).
+async function filterChanged() {
   renderBar();
-  if (!S.flaggedOnly || isFlagged(S.pages[S.idx])) return;
-  const j = nextUnreviewed();
-  if (j >= 0) await go(j); else hint("No flagged pages.");
+  if (visible(S.pages[S.idx])) return;
+  let j = nextUnreviewed();
+  if (j < 0) j = neighbour(1);
+  if (j < 0) j = neighbour(-1);
+  if (j >= 0) await go(j); else hint(`No ${filterName()} pages.`);
 }
 
 function loadImage(url) {
@@ -139,7 +160,7 @@ async function approveAndNext() {
   S.saveError = false;
   const j = neighbour(1);
   if (j >= 0) await go(j);
-  else hint(S.flaggedOnly ? "Approved. No more flagged pages after this one." : "Last page approved.");
+  else hint(filtered() ? `Approved. No more ${filterName()} pages after this one.` : "Last page approved.");
 }
 
 // ---------- saving ----------
@@ -649,10 +670,11 @@ document.addEventListener("keydown", (e) => {
     case "ArrowLeft": step(-1); break;
     case "n": case "N": {
       const j = nextUnreviewed();
-      if (j >= 0) go(j); else hint(S.flaggedOnly ? "No other flagged pages." : "All pages approved.");
+      if (j >= 0) go(j); else hint(filtered() ? `No other unapproved ${filterName()} pages.` : "All pages approved.");
       break;
     }
     case "f": case "F": toggleFlagged(); break;
+    case "e": case "E": cycleEditFilter(); break;
     case "u": case "U": setStatus("proposed"); break;
     case "l": case "L": askPage(); break;
     case "s": case "S": startStampMode(); break;
@@ -685,9 +707,9 @@ function renderBar() {
   });
   sel.selectedIndex = S.idx;
   const flagged = S.pages.filter(isFlagged);
-  if (S.flaggedOnly) {
-    const k = flagged.indexOf(S.pages[S.idx]);
-    $("pos").textContent = `${k >= 0 ? k + 1 : "–"} / ${flagged.length} flagged`;
+  if (filtered()) {
+    const shown = S.pages.filter(visible), k = shown.indexOf(S.pages[S.idx]);
+    $("pos").textContent = `${k >= 0 ? k + 1 : "–"} / ${shown.length} ${filterName()}`;
   } else {
     $("pos").textContent = `${S.idx + 1} / ${S.pages.length}`;
   }
@@ -695,6 +717,10 @@ function renderBar() {
   fb.textContent = `⚑ Flagged (${flagged.length})`;
   fb.classList.toggle("on", S.flaggedOnly);
   fb.disabled = !S.flaggedOnly && !flagged.length;
+  const edited = S.pages.filter((p) => p.edited).length, eb = $("edited");
+  eb.textContent = { all: `✎ All pages`, edited: `✎ Edited (${edited})`,
+                     unedited: `✎ Not edited (${S.pages.length - edited})` }[S.editFilter];
+  eb.classList.toggle("on", S.editFilter !== "all");
   const b = $("status-badge");
   b.textContent = S.page.status; b.className = S.page.status;
   const done = S.pages.filter((p) => p.status === "approved").length;
@@ -708,6 +734,7 @@ $("jump").addEventListener("change", (e) => { go(e.target.selectedIndex); e.targ
 $("prev").addEventListener("click", () => step(-1));
 $("next").addEventListener("click", () => step(1));
 $("flagged").addEventListener("click", () => toggleFlagged());
+$("edited").addEventListener("click", () => cycleEditFilter());
 $("approve").addEventListener("click", () => approveAndNext());
 $("ask").addEventListener("click", () => askPage());
 

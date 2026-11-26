@@ -8,6 +8,7 @@ button { font: inherit; padding: 3px 10px; cursor: pointer; }
 #bar .spacer { flex: 1; }
 #pos, #progress { color: #bbb; }
 #flagged.on { background: #ffa000; color: #000; }
+#edited.on { background: #42a5f5; color: #000; }
 #status-badge { padding: 1px 8px; border-radius: 9px; font-weight: 600; }
 #status-badge.approved { background: #2e7d32; color: #fff; }
 #status-badge.proposed { background: #8a6d00; color: #fff; }

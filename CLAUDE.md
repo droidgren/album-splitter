@@ -132,6 +132,8 @@ Implemented in `albumsplit/review/` (vanilla JS, no build step/CDN). Notes:
 - **F** / the ⚑ Flagged button limits navigation (←/→, N, Enter, jump list) to pages flagged for a
   check (not approved, with `issues` or a photo with `needs_review`, as counted on the start page).
   Remembered in `localStorage`.
+- **E** / the ✎ button cycles all pages → only edited (`page.edited`, approved ones included) → only
+  not edited. Combines with Flagged (both must let a page through); also in `localStorage`.
 - `photos[].caption` / `photos[].date` are reviewer overrides; `None` = derive from the linked
   texts and the stamp (`model.effective_caption` / `effective_date`, which export must use).
   Derived captions are flattened to one line (`model.flatten_caption`: line breaks -> spaces,
