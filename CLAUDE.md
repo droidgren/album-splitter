@@ -108,6 +108,12 @@ Implemented in `albumsplit/review/` (vanilla JS, no build step/CDN). Notes:
   included, is sent as it is now. `llm.apply(keep_links=True)` keeps the links on the page and
   only links texts without one; transcriptions/dates are replaced. Uses the cache, so an
   unchanged page costs nothing. Batches carry `keep_links` in `llm/batches.json`.
+- Choosing a scan folder **inside** the one recorded in `workdir.json` scopes the project to it
+  (`server.resolve_scan_folder`, `model.source_in_scope`): stats, review's page list, detect,
+  Claude-only, date guesses and export cover only pages under it; the recorded root and the page
+  ids never change. A folder outside it is refused while the work folder has pages (every id would
+  change), unless the recorded folder no longer exists (scans moved) or the pages' scans are found
+  under the chosen folder rather than the recorded one (`_found_under`, a wrong root recorded).
 - Scans are found via `<work_dir>/workdir.json` (written by detect); `--input` overrides it
   (Docker: `review /work --input /scans --host 0.0.0.0`). Previews are cached in `<work_dir>/preview/`.
 - **L** / "Ask Claude" re-runs the LLM linking+transcription on the current page as edited

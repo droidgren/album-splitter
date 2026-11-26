@@ -86,3 +86,13 @@ def test_flatten_caption():
     from albumsplit.model import derived_caption
     assert derived_caption(page, ph) == "Titta så fint guldklimpen!"
     assert page.texts[0].transcription == "Titta så fint\nguldklimpen!"
+
+
+def test_source_in_scope():
+    from albumsplit.model import source_in_scope
+    assert source_in_scope("Emil/Emil-1/a.jpg", "")
+    assert source_in_scope("Emil/Emil-1/a.jpg", "Emil/Emil-1")
+    assert source_in_scope("Emil/Emil-1/a.jpg", "Emil")
+    assert not source_in_scope("Emil/Emil-10/a.jpg", "Emil/Emil-1")
+    assert not source_in_scope("top.jpg", "Emil")
+    assert source_in_scope("Emil/Emil-1", "Emil/Emil-1")  # an album folder itself (dates.py)

@@ -64,6 +64,10 @@ function renderProject(proj) {
   if (!proj.work_dir) return;
   const s = proj.stats;
   stats = s;
+  // A folder inside the project's scan folder: counts, review, detection and export cover it only.
+  $("scope-note").hidden = !proj.scope;
+  $("scope-note").textContent = proj.scope
+    ? `Only ${proj.scope} of the project with the scans in ${proj.scan_root}.` : "";
   const stat = (n, label, cls = "") => `<div class="stat ${cls}"><b>${n ?? "?"}</b>${label}</div>`;
   $("stats").innerHTML = stat(s.scans, "scans") + stat(s.pages, "pages detected")
     + stat(s.new, "not detected yet", s.new ? "warn" : "") + stat(s.approved, "approved", s.approved ? "ok" : "")

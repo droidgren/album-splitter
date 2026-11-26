@@ -22,7 +22,8 @@ from fastapi.staticfiles import StaticFiles
 
 from ..imageio import IMAGE_EXTS, downscale, find_images, load_bgr
 from ..llm import DEFAULT_MODEL, EFFORTS, MODELS
-from ..model import DateStamp, Page, assign_page_ids, date_source, derived_caption, derived_date
+from ..model import (DateStamp, Page, assign_page_ids, date_source, derived_caption, derived_date,
+                     source_in_scope)
 from ..pipeline import (load_export_dir, load_guess_dates, load_input_dir, load_llm_effort,
                         load_llm_model, page_json_path, save_export_dir, save_guess_dates, save_input_dir,
                         save_llm_effort, save_llm_model)
@@ -60,6 +61,39 @@ def _inside(child: Path, parent: Path) -> bool:
         return False
 
 
+def resolve_scan_folder(work: Path, inp: Path) -> tuple[Path, str]:
+    """The scan root and scope for a chosen scan folder `inp` (resolved).
+
+    A folder inside the root recorded in the work folder narrows the project to it: page ids
+    and sources stay relative to the root. A folder outside it is refused while the work
+    folder has pages (every page id would change), unless the recorded root is gone (scans
+    moved) or the pages' scans are found under `inp` and not under the recorded root (a
+    wrong root was recorded). Otherwise `inp` becomes the root.
+    """
+    recorded = load_input_dir(work) if work.is_dir() else None
+    if recorded is None or not recorded.is_dir():
+        return inp, ""
+    recorded = recorded.resolve()
+    if inp == recorded or _inside(inp, recorded):
+        rel = inp.relative_to(recorded).as_posix()
+        return recorded, "" if rel == "." else rel
+    if any((work / "pages").glob("*.json")) and _found_under(work, inp) <= _found_under(work, recorded):
+        raise HTTPException(422, f"This work folder holds pages for the scans in {recorded}. "
+                                 "Choose that folder or one inside it, or another work folder.")
+    return inp, ""
+
+
+def _found_under(work: Path, root: Path, sample: int = 20) -> int:
+    """How many of the first `sample` pages of a work folder have their scan under `root`."""
+    n = 0
+    for path in sorted((work / "pages").glob("*.json"))[:sample]:
+        try:
+            n += (root / Page.load(path).source).is_file()
+        except Exception:
+            continue
+    return n
+
+
 def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
                llm_model: str = DEFAULT_MODEL, llm_effort: str | None = None,
                config_dir: Path | None = None) -> FastAPI:
@@ -68,8 +102,10 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
     lock = threading.Lock()          # page JSON writes
     llm_lock = threading.Lock()      # creating the Claude client
     preview_locks: dict[str, threading.Lock] = {}
-    st: dict = {"work": None, "input": None, "job": None, "llms": {}, "export": None,
-                "exiftool": None}
+    # "input" is the scan root recorded in workdir.json (page ids and sources are relative to
+    # it); "scope" narrows the project to a folder inside it (POSIX, relative; "" = all).
+    st: dict = {"work": None, "input": None, "scope": "", "job": None, "llms": {},
+                "export": None, "exiftool": None}
     # The CLI's --llm-model is the default; the start page can choose another per project.
     model_ids = [m[0] for m in MODELS] + ([llm_model] if llm_model not in {m[0] for m in MODELS} else [])
 
@@ -103,7 +139,8 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
         inp = inp.expanduser().resolve()
         if not inp.is_dir():
             raise HTTPException(422, f"Scan folder not found: {inp}")
-        if work == inp or _inside(work, inp):
+        root, scope = resolve_scan_folder(work, inp)
+        if work == root or _inside(work, root):
             raise HTTPException(422, "The work folder must not be inside the scan folder "
                                      "(the scans are never written to).")
         if work.exists() and not work.is_dir():
@@ -115,27 +152,33 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
         if ex is not None and ex.running and ex.work_dir != work:
             raise HTTPException(409, "An export is running for another project.")
         work.mkdir(parents=True, exist_ok=True)
-        if load_input_dir(work) != inp:
-            save_input_dir(work, inp)
-        st["work"], st["input"] = work, inp
+        if load_input_dir(work) != root:
+            save_input_dir(work, root)
+        st["work"], st["input"], st["scope"] = work, root, scope
         preview_locks.clear()
         remember(work, inp)
 
     if work_dir is not None:
         wd = Path(work_dir).resolve()
-        st["work"], st["input"] = wd, Path(input_dir).resolve() if input_dir else load_input_dir(wd)
+        if input_dir:
+            st["work"] = wd
+            st["input"], st["scope"] = resolve_scan_folder(wd, Path(input_dir).resolve())
+        else:
+            st["work"], st["input"] = wd, load_input_dir(wd)
 
     def project() -> tuple[Path, Path]:
         if st["work"] is None or st["input"] is None:
             raise HTTPException(409, "No project chosen")
         return st["work"], st["input"]
 
-    def stats(work: Path, inp: Path) -> dict:
+    def stats(work: Path, inp: Path, scope: str = "") -> dict:
         counts = {"pages": 0, "approved": 0, "edited": 0, "needs_review": 0}
         for path in (work / "pages").glob("*.json"):
             try:
                 pg = Page.load(path)
             except Exception:
+                continue
+            if not source_in_scope(pg.source, scope):
                 continue
             counts["pages"] += 1
             counts["approved"] += pg.status == "approved"
@@ -143,7 +186,7 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
             counts["needs_review"] += pg.status != "approved" and (
                 bool(pg.issues) or any(p.needs_review for p in pg.photos))
         try:
-            images = find_images(inp)
+            images = find_images(inp / scope)
             ids = assign_page_ids([p.relative_to(inp) for p in images])
             counts["scans"] = len(images)
             counts["new"] = sum(1 for pid in ids.values() if not page_json_path(work, pid).exists())
@@ -185,8 +228,10 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
                "exiftool": exiftool_info(),
                "api_key": bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"))}
         if st["work"] is not None and st["input"] is not None:
-            out.update(work_dir=str(st["work"]), input_dir=str(st["input"]),
-                       stats=stats(st["work"], st["input"]), pending=pending_info(st["work"]),
+            out.update(work_dir=str(st["work"]), input_dir=str(st["input"] / st["scope"]),
+                       scan_root=str(st["input"]), scope=st["scope"],
+                       stats=stats(st["work"], st["input"], st["scope"]),
+                       pending=pending_info(st["work"]),
                        guess_dates=load_guess_dates(st["work"]),
                        export_dir=str(load_export_dir(st["work"]) or st["work"] / "export"))
         return out
@@ -292,7 +337,8 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
         claude_only = bool(body.get("claude_only"))
         use_llm = bool(body.get("llm")) or claude_only
         llm = linker() if use_llm else None
-        st["job"] = DetectJob(input_dir=inp, work_dir=work, redo=bool(body.get("redo")),
+        st["job"] = DetectJob(input_dir=inp, work_dir=work, scope=st["scope"],
+                              redo=bool(body.get("redo")),
                               force=bool(body.get("force")) and not claude_only, llm=llm,
                               batch=bool(use_llm and body.get("batch")),
                               claude_only=claude_only, page_lock=lock,
@@ -302,7 +348,8 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
 
     def start_dates() -> None:
         work, inp = project()
-        st["job"] = DetectJob(input_dir=inp, work_dir=work, llm=linker(), dates_only=True,
+        st["job"] = DetectJob(input_dir=inp, work_dir=work, scope=st["scope"], llm=linker(),
+                              dates_only=True,
                               page_lock=lock)
         st["job"].start()
 
@@ -410,7 +457,7 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
             tool = st["exiftool"]["cmd"]
         out.mkdir(parents=True, exist_ok=True)
         save_export_dir(work, out)
-        st["export"] = ExportJob(input_dir=inp, work_dir=work, out_dir=out,
+        st["export"] = ExportJob(input_dir=inp, work_dir=work, out_dir=out, scope=st["scope"],
                                  include_proposed=bool(body.get("all")),
                                  cards=bool(body.get("cards", True)), exiftool=tool)
         st["export"].start()
@@ -471,6 +518,8 @@ def create_app(work_dir: Path | None = None, input_dir: Path | None = None, *,
             try:
                 pg = Page.load(path)
             except Exception:  # half-written or foreign file: skip, don't break the list
+                continue
+            if not source_in_scope(pg.source, st["scope"]):
                 continue
             linked = {lk.text_id for lk in pg.links}
             out.append({

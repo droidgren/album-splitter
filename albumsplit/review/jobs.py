@@ -13,7 +13,7 @@ from typing import Callable
 
 from ..detect import Params
 from ..imageio import find_images
-from ..model import Page, assign_page_ids
+from ..model import Page, assign_page_ids, source_in_scope
 from ..pipeline import page_json_path, process_page, save_input_dir
 
 
@@ -27,6 +27,7 @@ def _geometry(page: Page) -> tuple:
 class DetectJob:
     input_dir: Path
     work_dir: Path
+    scope: str = ""           # only scans/pages under this folder of input_dir ("" = all)
     redo: bool = False        # re-detect pages that exist but were not edited/approved
     force: bool = False       # re-detect every page, edited and approved ones too
     llm: object | None = None  # LlmLinker, or None for heuristic linking only
@@ -98,11 +99,12 @@ class DetectJob:
             if self.llm is None:
                 raise ValueError("Claude-only needs a Claude model")
             pages = [p for p in sorted((self.work_dir / "pages").glob("*.json"))
-                     if Page.load(p).status != "approved"]
+                     if (pg := Page.load(p)).status != "approved"
+                     and source_in_scope(pg.source, self.scope)]
             images, ids = [], {}
             self.total = len(pages)
         else:
-            images = find_images(self.input_dir)
+            images = find_images(self.input_dir / self.scope)
             ids = assign_page_ids([p.relative_to(self.input_dir) for p in images])
             save_input_dir(self.work_dir, self.input_dir)
             self.total = len(images)
@@ -146,7 +148,8 @@ class DetectJob:
 
         self.phase, self.done, self.total = "dates", 0, 0
         self.log.append("Guessing dates from the album order...")
-        rep = guess_dates(self.llm, self.work_dir, self.input_dir, log=self.log.append,
+        rep = guess_dates(self.llm, self.work_dir, self.input_dir, scope=self.scope,
+                          log=self.log.append,
                           stop=self._stop.is_set, page_lock=self.page_lock, on_progress=progress)
         if rep.cancelled:
             self.state = "cancelled"
@@ -255,6 +258,7 @@ class ExportJob:
     input_dir: Path
     work_dir: Path
     out_dir: Path
+    scope: str = ""           # only pages under this folder of input_dir ("" = all)
     include_proposed: bool = False
     cards: bool = True
     exiftool: list[str] | None = None
@@ -308,6 +312,7 @@ class ExportJob:
 
         rep = export_work_dir(self.work_dir, self.out_dir, self.input_dir,
                               include_proposed=self.include_proposed, cards=self.cards,
+                              scope=self.scope,
                               exiftool=self.exiftool, progress=self.log.append,
                               on_total=on_total, on_page=on_page, stop=self._stop.is_set)
         if not rep.cancelled:

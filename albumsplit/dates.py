@@ -32,7 +32,7 @@ from .imageio import downscale, load_bgr
 from .llm import (LlmLinker, _encode, _image, normalize_date, read_cache, warp_quad,
                   write_cache)
 from .model import (DateGuess, Issue, Page, Photo, caption_date, effective_caption,
-                    effective_date, page_id_from_path)
+                    effective_date, page_id_from_path, source_in_scope)
 
 DATES_PROMPT_VERSION = 3
 THUMB_LONG_SIDE = 512
@@ -410,14 +410,16 @@ class DatesReport:
 def guess_dates(linker: LlmLinker, work_dir: Path, input_dir: Path, *, force: bool = False,
                 log: Callable[[str], None] = print, stop: Callable[[], bool] = lambda: False,
                 page_lock=None, on_progress: Callable[[int, int], None] | None = None,
-                only_albums: set[str] | None = None) -> DatesReport:
-    """Guess dates for every album in the work dir (or `only_albums`) with direct API calls.
-    `force` asks again even where an answer is cached."""
+                only_albums: set[str] | None = None, scope: str = "") -> DatesReport:
+    """Guess dates for every album in the work dir (or `only_albums`, or the albums under the
+    folder `scope`) with direct API calls. `force` asks again even where an answer is cached."""
     rep = DatesReport()
     cache = work_dir / "llm" / "dates"
     work: list[tuple[DatesRequest, list[AlbumPage]]] = []
     for album, pages in albums(work_dir).items():
         if only_albums is not None and album not in only_albums:
+            continue
+        if not source_in_scope(album, scope):
             continue
         work += [(r, pages) for r in build_requests(album, pages, linker.tag)]
     rep.requests = len(work)

@@ -670,3 +670,69 @@ def test_version_endpoint(tmp_path):
     client = TestClient(create_app(config_dir=tmp_path / "cfg"))
     v = client.get("/api/version").json()
     assert v["text"].startswith(v["version"])
+
+
+def _album_project(tmp_path: Path):
+    """Scans in two albums plus one loose page; pages detected for Emil-1 and the loose one."""
+    from albumsplit.model import page_id_from_path
+    from albumsplit.pipeline import save_input_dir
+    scans, work = tmp_path / "scans", tmp_path / "work"
+    small = np.full((40, 60, 3), 245, np.uint8)
+    for rel in ("Emil/Emil-1/a.jpg", "Emil/Emil-1/b.jpg", "Emil/Emil-10/c.jpg", "top.jpg"):
+        (scans / rel).parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(scans / rel), small)
+    for rel in ("Emil/Emil-1/a.jpg", "Emil/Emil-1/b.jpg", "top.jpg"):
+        pid = page_id_from_path(rel)
+        Page(page_id=pid, source=rel, width=60, height=40).save(page_json_path(work, pid))
+    save_input_dir(work, scans.resolve())
+    return TestClient(create_app(config_dir=tmp_path / "cfg")), work, scans
+
+
+def test_sub_folder_of_project_is_a_scope(tmp_path: Path):
+    client, work, scans = _album_project(tmp_path)
+    before = (work / "workdir.json").read_text(encoding="utf-8")
+    r = client.post("/api/project", json={"work_dir": str(work), "input_dir": str(scans / "Emil" / "Emil-1")})
+    assert r.status_code == 200, r.text
+    info = r.json()
+    assert info["scope"] == "Emil/Emil-1" and info["scan_root"] == str(scans.resolve())
+    assert info["input_dir"] == str((scans / "Emil" / "Emil-1").resolve())
+    s = info["stats"]
+    assert (s["scans"], s["pages"], s["new"]) == (2, 2, 0)
+    assert [p["page_id"] for p in client.get("/api/pages").json()] == ["Emil__Emil-1__a", "Emil__Emil-1__b"]
+    assert (work / "workdir.json").read_text(encoding="utf-8") == before  # root and ids unchanged
+    # A scan of the page still loads from the recorded root.
+    assert client.get("/api/pages/Emil__Emil-1__a/image").status_code == 200
+
+    s = client.post("/api/project", json={"work_dir": str(work), "input_dir": str(scans / "Emil")}).json()["stats"]
+    assert (s["scans"], s["pages"], s["new"]) == (3, 2, 1)  # Emil-10 not detected yet
+    info = client.post("/api/project", json={"work_dir": str(work), "input_dir": str(scans)}).json()
+    assert info["scope"] == "" and (info["stats"]["scans"], info["stats"]["pages"], info["stats"]["new"]) == (4, 3, 1)
+
+
+def test_folder_outside_project_root_is_refused(tmp_path: Path):
+    client, work, scans = _album_project(tmp_path)
+    r = client.post("/api/project", json={"work_dir": str(work), "input_dir": str(tmp_path)})
+    assert r.status_code == 422 and "holds pages" in r.json()["detail"]
+    other = tmp_path / "other"
+    other.mkdir()
+    assert client.post("/api/project", json={"work_dir": str(work), "input_dir": str(other)}).status_code == 422
+
+
+def test_scoped_detect_only_touches_the_scope(tmp_path: Path, monkeypatch):
+    client, work, scans = _album_project(tmp_path)
+    client.post("/api/project", json={"work_dir": str(work), "input_dir": str(scans / "Emil" / "Emil-10")})
+    assert client.get("/api/project").json()["stats"]["new"] == 1
+    _run_detect(client, {})
+    assert page_json_path(work, "Emil__Emil-10__c").exists()
+    assert not page_json_path(work, "c").exists()
+    assert client.get("/api/project").json()["stats"]["new"] == 0
+
+
+def test_wrongly_recorded_sub_folder_root_can_be_corrected(tmp_path: Path):
+    """Before scopes, opening a sub-folder overwrote the recorded root: the real root fixes it."""
+    from albumsplit.pipeline import load_input_dir, save_input_dir
+    client, work, scans = _album_project(tmp_path)
+    save_input_dir(work, (scans / "Emil" / "Emil-1").resolve())
+    info = client.post("/api/project", json={"work_dir": str(work), "input_dir": str(scans)}).json()
+    assert info["scope"] == "" and info["stats"]["new"] == 1
+    assert load_input_dir(work) == scans.resolve()

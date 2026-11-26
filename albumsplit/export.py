@@ -16,7 +16,7 @@ from PIL import Image
 from .exiftool import tag_args, write_tags
 from .imageio import load_bgr
 from .llm import quad_transform, text_crop_full
-from .model import Page, Photo, date_source, effective_caption, effective_date
+from .model import Page, Photo, date_source, effective_caption, effective_date, source_in_scope
 
 # date_source: review, stamp, caption or guess (Claude, from the album order; see dates.py)
 INDEX_FIELDS = ["file", "card", "source", "page_id", "photo_id", "caption", "date", "date_source"]
@@ -149,7 +149,7 @@ def export_work_dir(work_dir: Path, out_dir: Path, input_dir: Path, *,
                     progress: Callable[[str], None] | None = None,
                     on_total: Callable[[int], None] | None = None,
                     on_page: Callable[[str], None] | None = None,
-                    stop: Callable[[], bool] | None = None) -> ExportReport:
+                    stop: Callable[[], bool] | None = None, scope: str = "") -> ExportReport:
     """Export every approved page of a work dir (all pages with `include_proposed`).
 
     `progress` gets one line per page, `on_total` the number of pages to export, `on_page`
@@ -168,6 +168,8 @@ def export_work_dir(work_dir: Path, out_dir: Path, input_dir: Path, *,
             say(f"{path.stem}: ERROR {e}")
             continue
         if only and not fnmatch.fnmatch(page.page_id, only):
+            continue
+        if not source_in_scope(page.source, scope):  # a folder inside the scans was chosen
             continue
         if page.status != "approved" and not include_proposed:
             report.skipped += 1

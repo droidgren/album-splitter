@@ -6,7 +6,7 @@ import json
 import re
 import unicodedata
 from dataclasses import asdict, dataclass, field
-from pathlib import Path, PurePath
+from pathlib import Path, PurePath, PurePosixPath
 from typing import Literal
 
 Point = tuple[float, float]
@@ -262,6 +262,15 @@ def page_id_from_path(rel_path: str | PurePath) -> str:
     p = PurePath(rel_path)
     parts = [*p.parts[:-1], p.stem]
     return "__".join(_UNSAFE.sub("_", _ascii(part)).strip("_") or "_" for part in parts)
+
+
+def source_in_scope(source: str, scope: str) -> bool:
+    """Whether a page's `source` lies under `scope` (a folder relative to the scan root, POSIX;
+    "" = everything). Compared per folder, so `Emil-1` does not match `Emil-10/x.jpg`."""
+    if not scope:
+        return True
+    want = PurePosixPath(scope).parts
+    return PurePosixPath(source).parts[:len(want)] == want
 
 
 # When one scan exists in several formats (IMG_0055.jpg + IMG_0055.tif), the first
