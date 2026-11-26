@@ -16,6 +16,24 @@ Claude (Anthropic API) is optional. It reads the handwriting, links captions on 
 double-checks date stamps and can guess dates for undated photos from the album order. Without
 it, detection and linking run locally with OpenCV.
 
+## What it does
+
+A scanned album page goes in (left). Detection finds the three prints, the three handwritten
+captions and the date stamp in each print, and links each caption to its photo (right):
+
+| Scanned page | Detected |
+|---|---|
+| ![A scanned album page with three prints and handwritten captions](docs/images/scan.jpg) | ![The same page with the photos, captions, links and read date stamps outlined](docs/images/detect.jpg) |
+
+Each photo is exported straightened at full resolution, with the caption and date
+(`1998-12-26`, read from the stamp `98 12 26`) in its metadata, plus a card with the handwritten
+caption underneath:
+
+![Three exported caption cards](docs/images/cards.jpg)
+
+The page and its photos are mock-ups: [docs/make_mock_page.py](docs/make_mock_page.py) paints
+them, and the results above are the real output of `detect` and `export` on that page.
+
 ## Installation
 
 Python 3.11 or newer.
@@ -48,10 +66,14 @@ This opens a start page at <http://127.0.0.1:8000/> where you:
 3. review the pages,
 4. export the approved pages.
 
+<img src="docs/images/start.png" alt="The start page: folders, project stats, detect, review and export" width="700">
+
 Scans are never modified. Everything Album Splitter knows about a page is stored as JSON in the
 work folder, so you can stop at any point and continue later.
 
 ### Reviewing a page
+
+![The review page: the scan with colored photo frames and linked captions, and a card per photo with caption, date and stamp](docs/images/review.png)
 
 | Key / action | Does |
 |---|---|
