@@ -97,10 +97,12 @@ def cmd_detect(args: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
-def _guess(llm, work_dir: Path, input_dir: Path, force: bool = False) -> bool:
+def _guess(llm, work_dir: Path, input_dir: Path, force: bool = False,
+           cache_dir: Path | None = None) -> bool:
     from .dates import guess_dates
     print("Guessing dates from the album order...")
-    rep = guess_dates(llm, work_dir, input_dir, force=force, log=lambda m: print("  " + m))
+    rep = guess_dates(llm, work_dir, input_dir, force=force, log=lambda m: print("  " + m),
+                      cache_dir=cache_dir)
     print(f"Dates: {rep.guessed} photos have a guessed date, {rep.undated} still undated, "
           f"{rep.suspects} dates out of order; {rep.pages_updated} pages updated "
           f"({rep.called} Claude calls, {rep.cached} cached"
@@ -122,6 +124,93 @@ def cmd_guess_dates(args: argparse.Namespace) -> int:
     if llm is None:
         return 1
     return 0 if _guess(llm, work_dir, input_dir, force=args.force) else 1
+
+
+def cmd_claude_code(args: argparse.Namespace) -> int:
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from .claude_code import ClaudeCodeLinker, llm_cache_dir, requests_dir
+    from .llm import LlmUnavailable
+    from .model import Page
+    from .pipeline import claude_page
+    work_dir = Path(args.work_dir).resolve()
+    if not (work_dir / "pages").is_dir():
+        print(f"No pages in {work_dir}; run detect first", file=sys.stderr)
+        return 1
+    input_dir = Path(args.input).resolve() if args.input else load_input_dir(work_dir)
+    if input_dir is None or not input_dir.is_dir():
+        print(f"Scan folder {input_dir} not found; pass --input", file=sys.stderr)
+        return 1
+    try:
+        llm = ClaudeCodeLinker(work_dir, args.model, effort=args.effort, claude=args.claude,
+                               mode="export" if args.export else "run", timeout=args.timeout)
+    except LlmUnavailable as e:
+        print(f"claude-code: {e}", file=sys.stderr)
+        return 1
+    if llm.claude:
+        print(f"Claude Code: {llm.claude} (model {args.model})")
+    cache = llm_cache_dir(work_dir)
+    ok = True
+    if not args.dates_only:
+        paths = []
+        for path in sorted((work_dir / "pages").glob("*.json")):
+            pg = Page.load(path)
+            if pg.status == "approved":
+                continue
+            if args.only and not fnmatch.fnmatch(pg.page_id, args.only):
+                continue
+            if args.flagged and not (pg.issues or any(ph.needs_review for ph in pg.photos)):
+                continue
+            paths.append(path)
+        print(f"{len(paths)} pages to read")
+        counts: dict[str, int] = {}
+        lock = threading.Lock()
+
+        def count(status: str) -> None:
+            with lock:
+                counts[status] = counts.get(status, 0) + 1
+
+        def one(path: Path) -> None:
+            t0 = time.perf_counter()
+            try:
+                res = claude_page(llm, work_dir, input_dir, path, debug=args.debug,
+                                  cache_dir=cache)
+            except Exception as e:  # keep going on a bad page
+                count("failed")
+                print(f"{path.stem}: ERROR {e}")
+                return
+            status = "waiting" if res.status == "failed" and args.export else res.status
+            count(status)
+            pg = res.page
+            note = {"called": "read by Claude Code", "cached": "cached",
+                    "failed": "no answer, page unchanged", "waiting": "request written",
+                    "skipped": "changed meanwhile, not updated"}[status]
+            if res.status in ("called", "cached"):
+                read = sum(1 for t in pg.texts if t.transcription)
+                note = f"{read} of {len(pg.texts)} texts read, {note}"
+                if pg.issues:
+                    note += f", {len(pg.issues)} issues"
+            print(f"{pg.page_id}: {note}  ({time.perf_counter() - t0:.1f}s)")
+
+        with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
+            list(pool.map(one, paths))
+        print("Pages: " + ", ".join(f"{v} {k}" for k, v in sorted(counts.items())) if counts
+              else "Pages: nothing to do")
+        if args.export and llm.pending:
+            print(f"{llm.pending} requests wait for an answer in {requests_dir(work_dir)} "
+                  "(see README.md there); run this command again afterwards.")
+        ok = not counts.get("failed")
+    if args.dates or args.dates_only:
+        if args.export and llm.pending and not args.dates_only:
+            print("Dates are guessed once the page answers are in: run with --dates-only then.")
+        else:
+            pending = llm.pending
+            ok = _guess(llm, work_dir, input_dir, force=args.force, cache_dir=cache) and ok
+            if args.export and llm.pending > pending:
+                print(f"{llm.pending - pending} date requests wait for an answer in "
+                      f"{requests_dir(work_dir)}; run this command again afterwards.")
+    return 0 if ok else 1
 
 
 def _make_linker(model: str, effort: str | None = None):
@@ -290,6 +379,32 @@ def main(argv: list[str] | None = None) -> int:
                    help="Claude effort (default: the project's, else the model's)")
     g.add_argument("--force", action="store_true", help="ask again even where an answer is cached")
     g.set_defaults(func=cmd_guess_dates)
+
+    cc = sub.add_parser("claude-code", help="read detected pages (and guess dates) with Claude "
+                                            "Code, using its login instead of an API key")
+    cc.add_argument("work_dir")
+    cc.add_argument("--input", help="scan directory (default: the one detect used)")
+    cc.add_argument("--model", default="opus",
+                    help="Claude Code model alias: opus, sonnet, haiku, fable (default: opus)")
+    cc.add_argument("--effort", choices=EFFORTS, help="Claude Code effort (default: its own)")
+    cc.add_argument("--only", help="only pages whose id matches this glob")
+    cc.add_argument("--flagged", action="store_true",
+                    help="only pages flagged for a check (issues or a photo to review)")
+    cc.add_argument("--dates", action="store_true",
+                    help="afterwards guess dates from the album order")
+    cc.add_argument("--dates-only", action="store_true", help="only guess dates")
+    cc.add_argument("--export", action="store_true",
+                    help="only write the requests to <work_dir>/claude-code/requests/ for a "
+                         "Claude Code session to answer; answers already there are applied")
+    cc.add_argument("--jobs", type=int, default=2, help="pages read at the same time (default: 2)")
+    cc.add_argument("--timeout", type=float, default=600, help="seconds per request (default: 600)")
+    cc.add_argument("--claude", help="Claude Code executable (default: $ALBUMSPLIT_CLAUDE, PATH, "
+                                     "or the VS Code extension's)")
+    cc.add_argument("--force", action="store_true",
+                    help="ask again even where an answer is cached (dates)")
+    cc.add_argument("--debug", action=argparse.BooleanOptionalAction, default=True,
+                    help="re-render debug images of updated pages (default: on)")
+    cc.set_defaults(func=cmd_claude_code)
 
     c = sub.add_parser("llm-collect", help="fetch finished --llm-batch results into the pages")
     c.add_argument("work_dir")

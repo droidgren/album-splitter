@@ -410,11 +410,12 @@ class DatesReport:
 def guess_dates(linker: LlmLinker, work_dir: Path, input_dir: Path, *, force: bool = False,
                 log: Callable[[str], None] = print, stop: Callable[[], bool] = lambda: False,
                 page_lock=None, on_progress: Callable[[int, int], None] | None = None,
-                only_albums: set[str] | None = None, scope: str = "") -> DatesReport:
+                only_albums: set[str] | None = None, scope: str = "",
+                cache_dir: Path | None = None) -> DatesReport:
     """Guess dates for every album in the work dir (or `only_albums`, or the albums under the
     folder `scope`) with direct API calls. `force` asks again even where an answer is cached."""
     rep = DatesReport()
-    cache = work_dir / "llm" / "dates"
+    cache = (cache_dir or work_dir / "llm") / "dates"
     work: list[tuple[DatesRequest, list[AlbumPage]]] = []
     for album, pages in albums(work_dir).items():
         if only_albums is not None and album not in only_albums:

@@ -68,6 +68,20 @@ re-run or reviewed later without losing manual edits.
   Albums are split into requests of at most 40 photos to date (plus 25 context pages each side).
   Always direct calls (cheap), also after a batch. Cached in `llm/dates/`. Approved pages are
   context only. `guess-dates <work_dir>` re-runs it; off for scans not in album order.
+- **Claude Code instead of the API key (`claude-code <work_dir>`, `claude_code.py`)**: runs the
+  same requests through Claude Code (the user's subscription). `ClaudeCodeLinker` only replaces
+  `LlmLinker._call`, so prompts, validation and `apply` are shared. Works on detected pages
+  like Claude-only (`pipeline.claude_page`, also used by the start page's Claude-only job:
+  links kept, approved or re-framed pages left alone); `--dates` / `--dates-only` run
+  `dates.guess_dates`. Each request becomes a folder `claude-code/requests/<key>__<hash>/`
+  (`request.md` with the system prompt and `NN.jpg` images, `schema.json`, `answer.json`).
+  Mode run: `claude -p` per request (`--json-schema`, `--system-prompt-file`, only the Read
+  tool, no MCP, `ANTHROPIC_API_KEY` removed from its env so the login is used); `run.json`
+  keeps its token usage. `--export`: only writes the folders, for a Claude Code session to
+  answer; the next run applies the answers found. Answers are cached apart from the API's in
+  `claude-code/llm/` as model `claude-code/<alias>` (`page.linker = "llm:claude-code/sonnet"`).
+  The executable: `--claude`, `$ALBUMSPLIT_CLAUDE`, PATH, then the VS Code extension's binary.
+  Start page and review (L, stamp reads) still use the API.
 
 Output: `<work_dir>/pages/<page_id>.json` with `photos[]`, `texts[]`, `links[]`,
 `status: "proposed" | "approved"`.

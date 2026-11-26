@@ -6,7 +6,6 @@ import threading
 import time
 import traceback
 from collections import deque
-from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -14,13 +13,7 @@ from typing import Callable
 from ..detect import Params
 from ..imageio import find_images
 from ..model import Page, assign_page_ids, source_in_scope
-from ..pipeline import page_json_path, process_page, save_input_dir
-
-
-def _geometry(page: Page) -> tuple:
-    """What Claude was shown: the photo frames and text boxes."""
-    return ([(p.id, [tuple(c) for c in p.corners]) for p in page.photos],
-            [(t.id, tuple(t.box)) for t in page.texts])
+from ..pipeline import claude_page, page_json_path, process_page, save_input_dir
 
 
 @dataclass
@@ -161,13 +154,6 @@ class DetectJob:
 
     def _claude_all(self, pages: list[Path], queue) -> None:
         """Ask Claude about each existing page as it is now; no detection."""
-        import cv2
-
-        from ..debug import render_debug
-        from ..imageio import load_bgr
-        from ..llm import apply
-        from ..pipeline import debug_path
-        cache = self.work_dir / "llm"
         for path in pages:
             if self._stop.is_set():
                 self.state = "cancelled"
@@ -175,42 +161,26 @@ class DetectJob:
                 return
             t0 = time.perf_counter()
             try:
-                page = Page.load(path)
-                self.current = page.page_id
-                img = load_bgr(self.input_dir / page.source)
-                if queue is not None:
-                    res, req = self.llm.cached(page, img, cache)
-                    if res is None:
-                        queue.add(req)
-                        self.queued = queue.queued
-                        self.log.append(f"{page.page_id}: queued for Claude")
-                        self.done += 1
-                        continue
-                    note = "Claude (cached)"
+                self.current = path.stem
+                res = claude_page(self.llm, self.work_dir, self.input_dir, path, queue=queue,
+                                  page_lock=self.page_lock)
+                pid = res.page.page_id if res.page else path.stem
+                if res.status == "queued":
+                    self.queued = queue.queued
+                    self.log.append(f"{pid}: queued for Claude")
+                elif res.status == "failed":
+                    self.failed += 1
+                    self.log.append(f"{pid}: Claude gave no usable answer, page unchanged")
+                elif res.status == "skipped":
+                    self.skipped += 1
+                    self.log.append(f"{pid}: changed in review meanwhile, not updated")
                 else:
-                    res = self.llm.link(page, img, cache)
-                    if res is None:
-                        self.failed += 1
-                        self.log.append(f"{page.page_id}: Claude gave no usable answer, page unchanged")
-                        self.done += 1
-                        continue
-                    note = "Claude (cached)" if res.cached else "read by Claude"
-                with self.page_lock or nullcontext():
-                    now = Page.load(path)  # the page may have been edited in review meanwhile
-                    if _geometry(now) != _geometry(page) or now.status == "approved":
-                        self.skipped += 1
-                        self.log.append(f"{page.page_id}: changed in review meanwhile, not updated")
-                        self.done += 1
-                        continue
-                    apply(now, res, keep_links=True)
-                    now.save(path)
-                out = debug_path(self.work_dir, now.page_id)
-                out.parent.mkdir(parents=True, exist_ok=True)
-                cv2.imwrite(str(out), render_debug(now, img), [cv2.IMWRITE_JPEG_QUALITY, 85])
-                self.detected += 1
-                read = sum(1 for t in now.texts if t.transcription)
-                self.log.append(f"{now.page_id}: {read} of {len(now.texts)} texts read, {note}"
-                                f" ({time.perf_counter() - t0:.1f}s)")
+                    self.detected += 1
+                    now = res.page
+                    note = "Claude (cached)" if res.status == "cached" else "read by Claude"
+                    read = sum(1 for t in now.texts if t.transcription)
+                    self.log.append(f"{pid}: {read} of {len(now.texts)} texts read, {note}"
+                                    f" ({time.perf_counter() - t0:.1f}s)")
             except Exception as e:  # keep going on a bad page
                 self.failed += 1
                 self.log.append(f"{path.stem}: ERROR {e}")

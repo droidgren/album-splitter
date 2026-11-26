@@ -175,3 +175,52 @@ def process_page(input_dir: Path, image_path: Path, work_dir: Path, *, force: bo
         out.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(out), render_debug(page, img), [cv2.IMWRITE_JPEG_QUALITY, 85])
     return Result(page_id, skipped=False, page=page, llm=llm_status)
+
+
+def page_geometry(page: Page) -> tuple:
+    """What Claude was shown: the photo frames and text boxes."""
+    return ([(p.id, [tuple(c) for c in p.corners]) for p in page.photos],
+            [(t.id, tuple(t.box)) for t in page.texts])
+
+
+ClaudeStatus = Literal["called", "cached", "queued", "failed", "skipped"]
+
+
+@dataclass
+class ClaudeResult:
+    status: ClaudeStatus
+    page: Page | None = None  # the page as saved (called/cached)
+
+
+def claude_page(llm: LlmLinker, work_dir: Path, input_dir: Path, path: Path, *,
+                queue: BatchQueue | None = None, page_lock=None, debug: bool = True,
+                cache_dir: Path | None = None) -> ClaudeResult:
+    """Ask Claude about an existing page as it is now; no detection. Frames, boxes and links
+    stay (Claude only links texts without a link). With `queue`, a request that is not cached
+    goes into the batch. A page approved or with frames/boxes changed meanwhile is left alone."""
+    from contextlib import nullcontext
+
+    from .llm import apply
+    page = Page.load(path)
+    img = load_bgr(input_dir / page.source)
+    cache = cache_dir or work_dir / "llm"
+    if queue is not None:
+        res, req = llm.cached(page, img, cache)
+        if res is None:
+            queue.add(req)
+            return ClaudeResult("queued", page)
+    else:
+        res = llm.link(page, img, cache)
+        if res is None:
+            return ClaudeResult("failed", page)
+    with page_lock or nullcontext():
+        now = Page.load(path)  # the page may have been edited in review meanwhile
+        if page_geometry(now) != page_geometry(page) or now.status == "approved":
+            return ClaudeResult("skipped", now)
+        apply(now, res, keep_links=True)
+        now.save(path)
+    if debug:
+        out = debug_path(work_dir, now.page_id)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(out), render_debug(now, img), [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return ClaudeResult("cached" if res.cached else "called", now)
