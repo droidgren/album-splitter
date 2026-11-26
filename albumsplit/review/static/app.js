@@ -425,7 +425,10 @@ canvas.addEventListener("pointerdown", (e) => {
     const p = S.stampFor !== null ? photoById(S.stampFor) : photoAt(x, y);
     if (!p) { hint("Alt+drag inside a photo to mark its date stamp."); S.drag = null; return; }
     S.drag = { ...base, mode: "create", stamp: p.id };
-  } else if (h >= 0) S.drag = { ...base, mode: "handle", handle: h };
+  } else if (h >= 0) {
+    S.drag = { ...base, mode: "handle", handle: h };
+    if (S.sel.kind === "photo") S.drag.start = clone(photoById(S.sel.id).corners);
+  }
   else if (e.shiftKey) S.drag = { ...base, mode: "create", photo: true };
   else if (insideSelected(x, y)) S.drag = { ...base, mode: "move" };
   else {
@@ -504,7 +507,9 @@ function toggleLink(tid, pid) {
 
 function dragHandle(h, x, y) {
   if (S.sel.kind === "photo") {
-    photoById(S.sel.id).corners[h] = [r1(x), r1(y)];
+    const p = photoById(S.sel.id), start = S.drag.start;
+    if (S.drag.ctrl || !start) p.corners[h] = [r1(x), r1(y)];  // Ctrl: move just this corner
+    else p.corners = dragPhotoCorner(start, h, x, y);
     return;
   }
   const t = textById(S.sel.id);
@@ -516,6 +521,28 @@ function dragHandle(h, x, y) {
   // Corner order may flip when a handle crosses the opposite side; keep dragging the one under the mouse.
   const cs = textCorners(t);
   S.drag.handle = cs.reduce((best, c, i) => (Math.hypot(c[0] - x, c[1] - y) < Math.hypot(cs[best][0] - x, cs[best][1] - y) ? i : best), 0);
+}
+
+// Dragging corner h of a photo moves the two edges that meet there, each parallel to itself
+// (so rotated prints keep their tilt); the neighbouring corners slide along the other two edges
+// and the opposite corner stays. Computed from the corners at drag start, so it never drifts.
+function dragPhotoCorner(start, h, x, y) {
+  const a = start[h], prev = start[(h + 3) % 4], next = start[(h + 1) % 4], o = start[(h + 2) % 4];
+  const P = [x, y];
+  const np = intersect(P, [a[0] - prev[0], a[1] - prev[1]], o, [prev[0] - o[0], prev[1] - o[1]]);
+  const nn = intersect(P, [a[0] - next[0], a[1] - next[1]], o, [next[0] - o[0], next[1] - o[1]]);
+  const cs = start.map((c) => [c[0], c[1]]);
+  cs[h] = P;
+  if (np && nn) { cs[(h + 3) % 4] = np; cs[(h + 1) % 4] = nn; }
+  return cs.map(([cx, cy]) => [r1(clampX(cx)), r1(clampY(cy))]);
+}
+
+// Intersection of the lines p + s*d and q + t*e, or null if (nearly) parallel.
+function intersect(p, d, q, e) {
+  const den = d[0] * e[1] - d[1] * e[0];
+  if (Math.abs(den) < 1e-9 * (Math.hypot(...d) * Math.hypot(...e) || 1)) return null;
+  const s = ((q[0] - p[0]) * e[1] - (q[1] - p[1]) * e[0]) / den;
+  return [p[0] + s * d[0], p[1] + s * d[1]];
 }
 
 function moveSelected(dx, dy) {

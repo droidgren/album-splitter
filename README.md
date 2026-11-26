@@ -61,7 +61,7 @@ work folder, so you can stop at any point and continue later.
 | **F** | only visit pages flagged for a check |
 | Click a caption, then a photo | link or unlink them |
 | Drag on empty paper | new caption box (**Shift**+drag: new photo) |
-| Drag a corner | adjust a box |
+| Drag a corner | move the two edges that meet there (**Ctrl**+drag: only that corner) |
 | **Delete** | remove the selected box |
 | **R** / **Shift+R** | rotate the exported photo |
 | **S** or **Alt**+drag | mark a date stamp detection missed |

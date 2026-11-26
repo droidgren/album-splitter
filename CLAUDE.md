@@ -79,7 +79,7 @@ Output: `<work_dir>/pages/<page_id>.json` with `photos[]`, `texts[]`, `links[]`,
   same color; unlinked text in grey.
 - Keyboard first: **Enter** = approve + next, **←/→** = prev/next, **N** = next unreviewed.
 - Click a text box, then a photo → toggle link. Drag on empty area → new text box
-  (Shift+drag → new photo). Drag corners to adjust. Delete key removes selected box.
+  (Shift+drag → new photo). Drag corners to adjust (a photo corner moves both its edges, each parallel to itself, so the neighbouring corners follow; Ctrl+drag moves only the corner). Delete key removes selected box.
 - Editable transcription/date fields per photo (prefilled if LLM was used).
 - Saves to the page JSON on every change.
 
